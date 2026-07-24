@@ -1,0 +1,25 @@
+# build outputs
+bin/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# per-node runtime state — includes PRIVATE KEYS (node.key) and the chain databases
+data/
+logs/
+
+# private keys / wallets — never commit
+*.key
+
+# local demo artifacts
+proof*.txt
+mydoc.txt
+
+# editor / OS cruft
+.vs/
+.vscode/
+*.user
+Thumbs.db

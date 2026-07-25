@@ -14,6 +14,42 @@ enum MsgType : uint8_t {
     M_BLOCK      = 6,  // raw block (new tip push)
 };
 
+// A frame larger than this is treated as protocol abuse and kills the link.
+constexpr size_t MAX_FRAME_BYTES = 8u * 1024 * 1024;
+// Byte budget for one M_BLOCKS reply. Counting only *blocks* is not enough:
+// blocks can be ~5.7 MB each (5000 txs x 1 KB payload), so 200 of them is over
+// a gigabyte and just 8 busy ones already exceed MAX_FRAME_BYTES. The receiver
+// then drops the connection, sync restarts, and hits the same wall forever --
+// a node that fell far enough behind could never catch up. Budget by bytes and
+// let the batch be short.
+constexpr size_t MAX_BLOCKS_PAYLOAD = 6u * 1024 * 1024;
+constexpr uint32_t MAX_BLOCKS_PER_BATCH = 200;
+// A link that connects but never completes HELLO is dropped after this long, and
+// no more than MAX_PEERS links are kept at once.
+constexpr uint64_t HANDSHAKE_TIMEOUT_MS = 15000;
+constexpr size_t   MAX_PEERS = 64;
+
+// Encode blocks [start, start+cnt) as an M_BLOCKS payload, stopping early to stay
+// within MAX_BLOCKS_PAYLOAD. Always emits at least one block when one exists, so
+// sync still advances even if a single block is larger than the budget (the
+// worst case, ~5.7 MB, still fits inside MAX_FRAME_BYTES).
+inline bytes build_blocks_payload(const std::vector<Block>& blocks, uint64_t start, uint32_t cnt) {
+    cnt = std::min(cnt, MAX_BLOCKS_PER_BATCH);
+    std::vector<bytes> raws;
+    size_t total = 4;                       // the leading u32 count
+    for (uint64_t h = start; h < blocks.size() && raws.size() < cnt; h++) {
+        bytes raw = blocks[(size_t)h].serialize();
+        size_t add = 4 + raw.size();        // u32 len + body
+        if (!raws.empty() && total + add > MAX_BLOCKS_PAYLOAD) break;
+        total += add;
+        raws.push_back(std::move(raw));
+    }
+    Writer w;
+    w.u32((uint32_t)raws.size());
+    for (auto& r : raws) { w.u32((uint32_t)r.size()); w.blob(r); }
+    return w.b;
+}
+
 struct Peer {
     SOCKET s = INVALID_SOCKET;
     std::string label;
@@ -23,6 +59,7 @@ struct Peer {
     bool dead = false;
     bool dedup_drop = false; // dropped as a redundant duplicate link, not a real disconnect
     uint16_t peer_port = 0;  // peer's advertised listen port (from HELLO)
+    uint64_t opened_ms = 0;  // for reaping links that never complete the handshake
     bytes inbuf, outbuf;
     uint64_t tip_height = 0, tip_work = 0;
     H256 tip_hash{};
@@ -40,8 +77,10 @@ public:
         targets = targets_;
         listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (listener == INVALID_SOCKET) return false;
-        int yes = 1;
-        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+        // No SO_REUSEADDR here either - see the note in rpc.h. With it set, a
+        // second node happily bound a p2p port another node already held, so two
+        // separate launcher instances merged into one tangled network instead of
+        // one of them failing to start.
         sockaddr_in a{};
         a.sin_family = AF_INET;
         a.sin_port = htons(port);
@@ -140,6 +179,7 @@ private:
             if (rc != 0 && WSAGetLastError() != WSAEWOULDBLOCK) { closesocket(s); continue; }
             Peer p;
             p.s = s; p.label = t; p.target = t; p.connecting = (rc != 0);
+            p.opened_ms = now_ms();
             if (!p.connecting) queue_hello(p);
             peers[next_id++] = std::move(p);
         }
@@ -182,10 +222,16 @@ private:
                         for (;;) {
                             SOCKET c = accept(listener, nullptr, nullptr);
                             if (c == INVALID_SOCKET) break;
+                            // Cap concurrent links. Without this, anyone who can
+                            // reach the p2p port can open sockets faster than we
+                            // reap them. ("Loopback only" is configuration --
+                            // the README invites pointing this at LAN IPs.)
+                            if (peers.size() >= MAX_PEERS) { closesocket(c); continue; }
                             set_nonblocking(c);
                             set_nodelay(c);
                             Peer p;
                             p.s = c;
+                            p.opened_ms = now_ms();
                             sockaddr_in sa{}; int sl = sizeof(sa);
                             if (getpeername(c, (sockaddr*)&sa, &sl) == 0)
                                 p.label = strf("in:%u", (unsigned)ntohs(sa.sin_port));
@@ -229,6 +275,15 @@ private:
                         }
                     }
                 }
+                // Reap links that connected but never finished HELLO. Previously
+                // such a peer sat in the map forever holding a socket and up to
+                // 16 MB of inbuf, with nothing to time it out.
+                {
+                    uint64_t now = now_ms();
+                    for (auto& [id, p] : peers)
+                        if (!p.dead && !p.ready && now - p.opened_ms > HANDSHAKE_TIMEOUT_MS)
+                            p.dead = true;
+                }
                 for (auto it = peers.begin(); it != peers.end();) {
                     if (it->second.dead) {
                         if (it->second.s != INVALID_SOCKET) closesocket(it->second.s);
@@ -250,7 +305,7 @@ private:
             if (p.inbuf.size() < 5) return;
             uint32_t len = (uint32_t)p.inbuf[0] | ((uint32_t)p.inbuf[1] << 8) |
                            ((uint32_t)p.inbuf[2] << 16) | ((uint32_t)p.inbuf[3] << 24);
-            if (len > 8u * 1024 * 1024) { p.dead = true; return; }
+            if (len > MAX_FRAME_BYTES) { p.dead = true; return; }
             if (p.inbuf.size() < 5 + (size_t)len) return;
             uint8_t type = p.inbuf[4];
             bytes payload(p.inbuf.begin() + 5, p.inbuf.begin() + 5 + len);

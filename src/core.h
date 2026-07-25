@@ -155,7 +155,15 @@ struct Account { uint64_t balance = 0; uint64_t nonce = 0; };
 using State = std::map<Addr20, Account>;
 
 // Validate + apply one tx to `st`. Returns "" on success, error string otherwise.
-inline std::string apply_tx(State& st, const Tx& t, const Params& p, uint64_t height, bool is_first) {
+//
+// `verify_sig` may be set false ONLY when the signature has already been checked
+// for this exact tx and the result is not consensus-binding. The single caller
+// that does so is Mempool::collect, which re-simulates txs that Mempool::add
+// already signature-checked on the way in; its output is a *candidate* block
+// that connect_block then validates in full, signatures included. Consensus
+// validation (connect_block -> apply_tx) always leaves this true.
+inline std::string apply_tx(State& st, const Tx& t, const Params& p, uint64_t height,
+                            bool is_first, bool verify_sig = true) {
     if (t.net_id != p.net_id) return "wrong network id";
     if (t.type == TX_COINBASE) {
         if (!is_first) return "coinbase must be first tx";
@@ -168,7 +176,7 @@ inline std::string apply_tx(State& st, const Tx& t, const Params& p, uint64_t he
     }
     if (is_first) return "first tx must be coinbase";
     if (is_zero(t.from)) return "missing sender";
-    if (!sig_verify(t.from, t.sign_hash(), t.sig)) return "bad signature";
+    if (verify_sig && !sig_verify(t.from, t.sign_hash(), t.sig)) return "bad signature";
     Addr20 a = addr_of(t.from);
     Account& acct = st[a];
     if (t.nonce != acct.nonce) return strf("bad nonce (want %llu got %llu)",
@@ -192,6 +200,7 @@ public:
     Params params;
     std::vector<Block> blocks;
     std::vector<H256>  hashes;
+    std::map<H256, uint32_t> hashidx;                     // block hash -> height
     State st;
     std::map<H256, std::pair<uint32_t, uint32_t>> txidx;  // txid -> (height, index)
     uint64_t work = 0;
@@ -213,9 +222,15 @@ public:
     uint64_t height() const { return blocks.empty() ? 0 : blocks.back().h.height; }
     const Block& tip() const { return blocks.back(); }
     const H256& tip_hash() const { return hashes.back(); }
-    bool has_block(const H256& h) const {
-        for (auto& x : hashes) if (x == h) return true;
-        return false;
+    // Indexed, not a scan: this is called for every gossiped block, under the
+    // node's global lock. At 100k blocks the old linear compare cost ~0.19 ms
+    // per call.
+    bool has_block(const H256& h) const { return hashidx.count(h) > 0; }
+    // Height of a block by hash, or -1. Backs GET /block?hash=, which used to
+    // walk the whole chain.
+    long long height_of(const H256& h) const {
+        auto it = hashidx.find(h);
+        return it == hashidx.end() ? -1 : (long long)it->second;
     }
 
     // Validate `b` as the next block and append it. "" on success.
@@ -266,11 +281,12 @@ public:
         if (tmp.work <= work) return "candidate has no more work than current chain";
         uint64_t fork = 0;
         while (fork < hashes.size() && fork < tmp.hashes.size() && hashes[fork] == tmp.hashes[fork]) fork++;
-        blocks = std::move(tmp.blocks);
-        hashes = std::move(tmp.hashes);
-        st     = std::move(tmp.st);
-        txidx  = std::move(tmp.txidx);
-        work   = tmp.work;
+        blocks  = std::move(tmp.blocks);
+        hashes  = std::move(tmp.hashes);
+        hashidx = std::move(tmp.hashidx);
+        st      = std::move(tmp.st);
+        txidx   = std::move(tmp.txidx);
+        work    = tmp.work;
         if (db && persisting) {
             db->exec("BEGIN IMMEDIATE");
             db_truncate_from(fork);
@@ -329,6 +345,7 @@ private:
         H256 bh = b.h.hash();
         for (size_t i = 0; i < b.txs.size(); i++)
             txidx[b.txs[i].txid()] = { (uint32_t)b.h.height, (uint32_t)i };
+        hashidx[bh] = (uint32_t)hashes.size();
         blocks.push_back(b);
         hashes.push_back(bh);
         work += w;
@@ -377,9 +394,12 @@ private:
 // ---------- mempool ----------
 class Mempool {
 public:
+    using Key = std::pair<Addr20, uint64_t>;
     // keyed by (sender address, nonce) so conflicting double-spends can't coexist
-    std::map<std::pair<Addr20, uint64_t>, Tx> m;
-    std::set<H256> ids;
+    std::map<Key, Tx> m;
+    // txid -> key, so has()/find() are lookups rather than a scan that recomputes
+    // sha256d over every pending tx (1.66 ms per miss at 1000 txs).
+    std::map<H256, Key> ids;
 
     std::string add(const Tx& t, const State& st, const Params& p) {
         if (t.type == TX_COINBASE) return "coinbase not allowed in mempool";
@@ -405,11 +425,18 @@ public:
         auto key = std::make_pair(a, t.nonce);
         if (m.count(key)) return "conflicting tx (same sender+nonce) already pending";
         m[key] = t;
-        ids.insert(id);
+        ids[id] = key;
         return "";
     }
 
     // Pick includable txs in valid nonce order (validated against a state copy).
+    //
+    // Signatures are NOT re-checked here: every tx in `m` had its signature
+    // verified by add(), and the block built from this list is fully validated
+    // by connect_block before it can be appended. Re-verifying made this call
+    // cost ~120 ms for a 1000-tx mempool -- and the miner runs it every 25 ms
+    // while holding the node's global mutex, which starved the RPC and the
+    // network threads almost completely.
     std::vector<Tx> collect(const State& base, const Params& p, uint64_t height, size_t maxn = 1000) {
         std::vector<Tx> out;
         State tmp = base;
@@ -420,7 +447,7 @@ public:
                 auto it = tmp.find(key.first);
                 uint64_t cur = (it == tmp.end()) ? 0 : it->second.nonce;
                 if (key.second != cur) continue;
-                if (apply_tx(tmp, tx, p, height, false).empty()) {
+                if (apply_tx(tmp, tx, p, height, false, /*verify_sig=*/false).empty()) {
                     out.push_back(tx);
                     progress = true;
                     if (out.size() >= maxn) break;
@@ -444,7 +471,10 @@ public:
     size_t size() const { return m.size(); }
     bool has(const H256& id) const { return ids.count(id) > 0; }
     std::optional<Tx> find(const H256& id) const {
-        for (auto& [k, t] : m) if (t.txid() == id) return t;
-        return std::nullopt;
+        auto i = ids.find(id);
+        if (i == ids.end()) return std::nullopt;
+        auto it = m.find(i->second);
+        if (it == m.end()) return std::nullopt;
+        return it->second;
     }
 };

@@ -136,6 +136,7 @@
         <div class="composebar">
           <button class="btn" id="postBtn">Sign &amp; post to chain</button>
           <span class="counter" id="noteCount">0 / 1024 bytes</span>
+          <span class="small" title="Your note is stored as {&quot;t&quot;:&quot;&lt;UTC time&gt;&quot;,&quot;msg&quot;:&quot;…&quot;} so the timestamp is signed along with the text.">incl. signed timestamp</span>
           <span class="grow"></span>
           <span class="small">signing as <span class="mono addr" id="noteAddr"></span></span>
         </div>
@@ -282,7 +283,13 @@ async function rget(path, port=PORT){ const r=await fetch(`http://${host}:${port
 async function rgetJson(path, port=PORT){ return await (await rget(path,port)).json(); }
 async function rgetText(path, port=PORT){ return await (await rget(path,port)).text(); }
 async function rpost(path, bodyText, port=PORT){
-  const r = await fetch(`http://${host}:${port}${path}`, {method:"POST", body:bodyText}); // text/plain => no CORS preflight
+  // X-Chainlite is required by the node on writes. A page from another site
+  // cannot set it without a CORS preflight, and the node answers preflights only
+  // for its own sibling nodes — that is what stops a drive-by POST /submit.
+  // Same-origin requests skip preflight entirely; posting to a sibling node
+  // (via the node picker) preflights and is allowed.
+  const r = await fetch(`http://${host}:${port}${path}`,
+                        {method:"POST", body:bodyText, headers:{"X-Chainlite":"1"}});
   return await r.json();
 }
 
@@ -377,12 +384,39 @@ let NOTES = [];            // newest first, from /records
 let seenTxids = new Set(); // for the "fresh" highlight animation
 let firstFeedLoad = true;
 
+// Notes written here are wrapped in a small JSON envelope so the author's own
+// UTC timestamp travels INSIDE the signed payload:
+//     {"t":"2026-07-25T14:45:18.123Z","msg":"Hello World!"}
+// The block header carries a time too, but that is the *miner's* claim about when
+// the block was sealed, it is shared by every note in the block, and it is only
+// bounded against future skew. The envelope is the *author's* claim about when the
+// note was written, and it is covered by the signature — so it cannot be altered
+// without the key, by a miner or by anyone else.
+function noteEnvelope(text, iso){
+  return JSON.stringify({ t: iso || new Date().toISOString(), msg: text });
+}
+function buildNotePayload(text, iso){ return enc.encode(noteEnvelope(text, iso)); }
+// Recognise the envelope, or return null so the payload renders as plain text.
+// Deliberately strict: an anchor record like {"v":1,"kind":"intercom-anchor",...}
+// has no msg/t and must NOT be mistaken for a timestamped note.
+function parseNoteEnvelope(text){
+  let o = null;
+  try{ o = JSON.parse(text); }catch(e){ return null; }
+  if(!o || typeof o !== "object" || Array.isArray(o)) return null;
+  if(typeof o.msg !== "string" || typeof o.t !== "string") return null;
+  if(!isFinite(Date.parse(o.t))) return null;
+  return { t:o.t, msg:o.msg };
+}
 function decodePayload(hex){
   const bytes = fromHex(hex);
   try{
     const text = new TextDecoder("utf-8",{fatal:true}).decode(bytes);
     // printable text => a note
-    if(!/[\x00-\x08\x0e-\x1f]/.test(text)) return {kind:"text", text};
+    if(!/[\x00-\x08\x0e-\x1f]/.test(text)){
+      const env = parseNoteEnvelope(text);           // timestamped note?
+      if(env) return {kind:"text", text:env.msg, authored:env.t};
+      return {kind:"text", text};                    // plain note (older, or clctl)
+    }
   }catch(e){}
   return {kind:"hash", text:hex};
 }
@@ -429,12 +463,17 @@ function renderFeed(){
     const actions = r.status==="confirmed"
       ? `<a onclick="lookup('${r.txid}')">tx ${r.txid.slice(0,12)}…</a><a onclick="getProof('${r.txid}')">prove it</a>`
       : `<a onclick="lookup('${r.txid}')">tx ${r.txid.slice(0,12)}…</a>`;
+    // Prefer the author's signed timestamp when the note carries one; fall back to
+    // the block's. Both are chain-controlled strings, so both get escaped.
+    const when = d.authored
+      ? `<span title="${esc("written " + d.authored + " — author-stated, inside the signed payload")}">${esc(timeAgo(Math.floor(Date.parse(d.authored)/1000)))}</span>`
+      : `<span title="block timestamp — miner-stated">${esc(timeAgo(r.time))}</span>`;
     return `<div class="${cls}">
       <div class="note-head">
         <span class="who" onclick="lookup('${r.from}')">${r.from.slice(0,12)}…</span>
         ${mine?'<span class="chip you">you</span>':''}
         ${status}
-        <span>${timeAgo(r.time)}</span>
+        ${when}
       </div>
       ${body}
       <div class="note-actions">${actions}</div>
@@ -443,8 +482,13 @@ function renderFeed(){
   NOTES.forEach(r=>seenTxids.add(r.txid));
   firstFeedLoad = false;
 }
+// Count the bytes that actually go on chain — envelope included — or a note could
+// pass the counter and then be rejected by the node's 1 KB payload cap.
 function updateCounter(){
-  const n = enc.encode($("#noteText").value).length;
+  const t = $("#noteText").value;
+  // Show 0 for an empty box — the envelope's ~40 bytes are real, but reporting
+  // them before anything is typed just looks broken.
+  const n = t ? buildNotePayload(t).length : 0;
   const el = $("#noteCount");
   el.textContent = `${n} / 1024 bytes`;
   el.classList.toggle("over", n>1024);
@@ -453,8 +497,8 @@ async function postNote(){
   const text = $("#noteText").value;
   const msg = $("#noteMsg");
   if(!text.trim()){ msg.className="msg err show"; msg.textContent="write something first"; return; }
-  const payload = enc.encode(text);
-  if(payload.length>1024){ msg.className="msg err show"; msg.textContent=`too long: ${payload.length} bytes (max 1024)`; return; }
+  const payload = buildNotePayload(text);   // text + the author's UTC timestamp
+  if(payload.length>1024){ msg.className="msg err show"; msg.textContent=`too long: ${payload.length} bytes including the timestamp (max 1024)`; return; }
   $("#postBtn").disabled = true;
   try{
     const txid = await makeAndSubmit(TX_RECORD, new Uint8Array(20), 0, payload, msg);
@@ -543,6 +587,8 @@ async function showTx(id){
   if(t.type===2 && t.payload_hex){
     const d = decodePayload(t.payload_hex);
     payloadView=`<div class="k">payload</div><div>${d.kind==="text"?`“${esc(d.text)}”`:`sha256 <code>${esc(d.text)}</code>`}</div>`;
+    if(d.authored) payloadView+=`<div class="k">written</div><div><code>${esc(d.authored)}</code> `
+      + `<span class="small">author-stated, inside the signed payload</span></div>`;
   }
   const proofBtn = t.status==="confirmed" ? `<button class="btn sec" onclick="getProof('${id}')">Get proof</button>` : "";
   $("#qout").innerHTML=`<div class="card" style="margin-top:12px"><h2>Transaction ${TAGS[t.type]||''}</h2>
@@ -621,9 +667,13 @@ async function verifyProof(){
   const agree=nodeRows.filter(r=>r[1]===true).length;
   const reach=nodeRows.filter(r=>r[1]!==null).length;
   const valid=allLocal && agree>0 && agree===reach;
+  // Everything here comes from a proof the user pasted, i.e. from whoever gave
+  // them that file — escape it all. (blockhash used to go in raw: 20 characters
+  // survive tshort(), which is exactly enough for "<svg onload=...>", and this
+  // page holds a spendable key in localStorage.)
   out.innerHTML=`<div class="card" style="margin-top:12px">
     <div class="kv"><div class="k">txid</div><div>${esc(txid)}</div>
-      <div class="k">committed at</div><div>height ${height}, block ${tshort(blockhash,20)}</div></div>
+      <div class="k">committed at</div><div>height ${esc(height)}, block ${esc(tshort(blockhash,20))}</div></div>
     <table style="margin-top:10px"><tbody>
     ${checks.map(c=>`<tr><td>${c[0]}</td><td style="color:${c[1]?'var(--good)':'var(--bad)'}">${c[1]?'✓ pass':'✗ FAIL'}</td></tr>`).join("")}
     ${nodeRows.map(r=>`<tr><td>${r[0]} agrees</td><td style="color:${r[1]===true?'var(--good)':r[1]===null?'var(--dim)':'var(--bad)'}">${r[1]===true?'✓ '+r[2]:r[2]}</td></tr>`).join("")}
@@ -696,8 +746,12 @@ function refreshAll(){ refreshStatus(); refreshBlocks(); refreshMempool(); refre
 async function discoverNodes(){
   try{
     const d = await rgetJson("/nodes", PORT);
-    if(d && Array.isArray(d.rpc) && d.rpc.length){
-      PORTS = d.rpc;
+    // PORTS is interpolated into markup and onclick handlers below, so keep it
+    // strictly numeric no matter what the node returned.
+    const clean = (d && Array.isArray(d.rpc) ? d.rpc : [])
+      .map(Number).filter(n => Number.isInteger(n) && n > 0 && n < 65536);
+    if(clean.length){
+      PORTS = clean;
       if(!PORTS.includes(PORT)) PORT = PORTS[0];
     }
   }catch(e){ /* keep defaults */ }

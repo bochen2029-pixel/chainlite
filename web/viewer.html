@@ -250,8 +250,10 @@
 
 <script>
 "use strict";
-const PORTS = [8501,8502,8503];
-let PORT = PORTS[0];
+// Defaults for the classic 3-node layout; replaced at startup by whatever the
+// serving node reports via GET /nodes (the launcher may shift ports if 8501+ are taken).
+let PORTS = [8501,8502,8503];
+let PORT = Number(location.port) || PORTS[0];
 const $ = s => document.querySelector(s);
 const host = location.hostname || "127.0.0.1";
 
@@ -370,6 +372,7 @@ async function makeAndSubmit(type, to20, amount, payload, msgEl){
 }
 
 // ---------- notes feed ----------
+let divergedPolls = 0;     // consecutive sweeps that saw differing tips (debounce)
 let NOTES = [];            // newest first, from /records
 let seenTxids = new Set(); // for the "fresh" highlight animation
 let firstFeedLoad = true;
@@ -480,9 +483,19 @@ async function refreshStatus(){
   const live=strip.filter(x=>x.s);
   const tips=new Set(live.map(x=>x.s.tip));
   const conv=$("#conv");
-  if(live.length===0){ conv.innerHTML=""; }
-  else if(tips.size===1){ conv.innerHTML=`<span class="badge ok">✓ converged</span> all ${live.length} reachable nodes on tip <code>${tshort([...tips][0],14)}</code> at height ${live[0].s.height}`; }
-  else { conv.innerHTML=`<span class="badge no">⟳ syncing</span> nodes differ (heights ${live.map(x=>x.s.height).join(", ")}) — normal for a second after a new block`; }
+  if(live.length===0){ conv.innerHTML=""; divergedPolls=0; return; }
+  if(tips.size===1){
+    divergedPolls=0;
+    conv.innerHTML=`<span class="badge ok">✓ converged</span> all ${live.length} reachable nodes on tip <code>${tshort([...tips][0],14)}</code> at height ${live[0].s.height}`;
+    return;
+  }
+  // The three nodes are polled one after another, so a block landing mid-sweep makes
+  // them look forked when they aren't. Only report divergence once it survives two
+  // consecutive sweeps, and then show the tips — the thing that actually differs.
+  divergedPolls++;
+  if(divergedPolls<2) return;   // keep the previous (converged) message
+  conv.innerHTML=`<span class="badge no">⟳ syncing</span> nodes hold different tips: `
+    + live.map(x=>`:${x.p} <code>${tshort(x.s.tip,10)}</code>@${x.s.height}`).join(" · ");
 }
 async function refreshBlocks(){
   try{
@@ -676,13 +689,28 @@ $("#recBtn").onclick=async()=>{
 };
 $("#verifyBtn").onclick=()=>verifyProof().catch(e=>$("#verifyOut").innerHTML=`<div class="msg err show">${esc(e.message)}</div>`);
 
-// ---------- loop ----------
+// ---------- startup ----------
 function refreshAll(){ refreshStatus(); refreshBlocks(); refreshMempool(); refreshNotes(); refreshWalletBalance(); }
-renderNodes();
-updateCounter();
-loadWallet();
-refreshAll();
-setInterval(()=>{ refreshStatus(); refreshBlocks(); refreshMempool(); refreshNotes(); }, 2500);
+// Ask the node that served this page which nodes make up the network, so the
+// node picker and cross-node checks work on any port layout.
+async function discoverNodes(){
+  try{
+    const d = await rgetJson("/nodes", PORT);
+    if(d && Array.isArray(d.rpc) && d.rpc.length){
+      PORTS = d.rpc;
+      if(!PORTS.includes(PORT)) PORT = PORTS[0];
+    }
+  }catch(e){ /* keep defaults */ }
+  renderNodes();
+}
+(async function init(){
+  renderNodes();
+  updateCounter();
+  await discoverNodes();
+  await loadWallet();
+  refreshAll();
+  setInterval(()=>{ refreshStatus(); refreshBlocks(); refreshMempool(); refreshNotes(); }, 2500);
+})();
 window.lookup=lookup; window.showBlock=showBlock; window.selectNode=selectNode;
 window.getProof=getProof; window.prefillSend=prefillSend;
 </script>

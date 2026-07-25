@@ -17,6 +17,14 @@ if not defined VSPATH (echo [!] Visual Studio with C++ tools not found & exit /b
 call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" >nul
 :have_cl
 
+REM --- embed the web viewer into a header so binaries are self-contained ---
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\embed.ps1"
+if %errorlevel% neq 0 (echo [!] embedding viewer.html failed & exit /b 1)
+
+echo === building chainlite.exe (all-in-one portable app) ===
+cl /nologo /std:c++17 /O2 /EHsc /DNDEBUG /I"%SRC%" "%SRC%\chainlite_app.cpp" /Fe"%BIN%\chainlite.exe" /Fo"%BIN%\\" /link ws2_32.lib bcrypt.lib shell32.lib
+if %errorlevel% neq 0 (echo [!] chainlite build failed & exit /b 1)
+
 echo === building clnode.exe ===
 cl /nologo /std:c++17 /O2 /EHsc /DNDEBUG /I"%SRC%" "%SRC%\clnode.cpp" /Fe"%BIN%\clnode.exe" /Fo"%BIN%\\" /link ws2_32.lib bcrypt.lib
 if %errorlevel% neq 0 (echo [!] clnode build failed & exit /b 1)

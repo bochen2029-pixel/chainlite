@@ -10,6 +10,10 @@ bin/
 # per-node runtime state — includes PRIVATE KEYS (node.key) and the chain databases
 data/
 logs/
+chainlite-data/
+
+# generated at build time from web/viewer.html by tools/embed.ps1
+src/viewer_html.h
 
 # private keys / wallets — never commit
 *.key

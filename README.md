@@ -43,15 +43,61 @@ can die) — bump the peer list to 4+ for f=1 BFT.
 
 ---
 
+## The one-file app
+
+**`chainlite.exe` is a complete blockchain in a single portable binary.** Copy that
+one file anywhere — a USB stick, a fresh machine — double-click it, and it:
+
+1. picks a free range of ports (so it never collides with another instance),
+2. spawns **three real validating node processes**,
+3. waits for them to come up and opens the notes UI in your browser,
+4. keeps the chain in `chainlite-data\` next to the exe.
+
+The web UI is compiled into the binary, so there is no `web\` folder to ship. Close
+the window (or Ctrl+C) and every node it started dies with it — the children live in
+a Windows job object with `KILL_ON_JOB_CLOSE`, so nothing is ever orphaned, even if
+the launcher is killed outright. Restart it and your chain (and notes) are still there.
+
+```bat
+chainlite.exe                     :: launch everything + open the browser
+chainlite.exe --no-browser        :: same, headless
+chainlite.exe --datadir D:\chain  :: keep the chain somewhere specific
+chainlite.exe --bits 20 --heartbeat 30
+chainlite.exe --reset             :: wipe the stored chain (keys kept)
+```
+
+It prints a live status line as blocks arrive:
+
+```
+   chainlite  -  a private blockchain in one window
+   ---------------------------------------------------------
+   data        C:\portable\chainlite-data
+   network     3 nodes  |  p2p 7501-7503  |  rpc 8501-8503
+   consensus   proof-of-work, 18 leading zero bits  |  heartbeat 12s
+
+   starting nodes... ok
+   opening     http://127.0.0.1:8501/
+
+   13:14:34  height 12     3/3 nodes up  4 notes on chain
+```
+
+`clnode.exe` (one node per process, driven by `run-network.bat`) is still there for
+the classic workflow — both binaries share the exact same node code (`src/node_impl.h`).
+
 ## Build
 
 Requires Visual Studio 2022 with the C++ toolset. CUDA is optional.
 
 ```bat
-build.bat            :: builds clnode.exe, clctl.exe, cl_selftest.exe
+build.bat            :: builds chainlite.exe, clnode.exe, clctl.exe, cl_selftest.exe
 build.bat gpu        :: also builds the CUDA miner (needs nvcc)
 build-gpu.bat        :: builds ONLY the CUDA miner (safe while nodes are running)
 ```
+
+`build.bat` runs `tools\embed.ps1` first, which turns `web\viewer.html` into
+`src\viewer_html.h` so the UI can be compiled in. When a node finds a real
+`web\viewer.html` next to it, it serves that instead — so editing the page during
+development hot-reloads with a browser refresh, no rebuild needed.
 
 Run the self-test first — it checks SHA-256 against the official NIST vectors,
 signatures, Merkle proofs, serialization, chain validation, the mempool, and a
@@ -183,7 +229,9 @@ use a high-difficulty network (e.g. `run-network.bat 30`).
 | `net.h` | non-blocking TCP gossip, one dedup'd link per peer pair |
 | `rpc.h` | tiny HTTP/1.1 server (127.0.0.1) for the node RPC |
 | `http_client.h` | blocking HTTP client for clctl / the GPU miner |
-| `clnode.cpp` | the node: wires storage + net + miner + RPC together |
+| `node_impl.h` | the node: wires storage + net + miner + RPC together |
+| `clnode.cpp` | one node per process (thin `main` over `node_impl.h`) |
+| `chainlite_app.cpp` | the all-in-one launcher: spawns 3 nodes, opens the UI |
 | `clctl.cpp` | wallet + query CLI |
 | `clminer_gpu.cu` | CUDA proof-of-work miner |
 | `selftest.cpp` | the test suite |

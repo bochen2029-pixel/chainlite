@@ -32,8 +32,13 @@ static std::string dir_of(const std::string& p) {
     return s == std::string::npos ? "." : p.substr(0, s);
 }
 
-// A port is "free" if we can bind it right now (no SO_REUSEADDR, so a live
-// listener is correctly detected as taken).
+// A port counts as taken only when something actually accepts a connection there.
+// Probing with bind() is the wrong test on Windows in both directions: a socket left
+// in TIME_WAIT by a previous run makes bind() fail (which would shove every quick
+// restart onto fresh ports, changing the URL for no reason), while SO_REUSEADDR —
+// which the nodes themselves use — will happily bind a port that IS in use. Asking
+// "does anyone answer?" is what we actually mean. On loopback a closed port refuses
+// immediately, so this stays fast.
 static bool port_free(uint16_t p) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return false;
@@ -41,9 +46,21 @@ static bool port_free(uint16_t p) {
     a.sin_family = AF_INET;
     a.sin_port = htons(p);
     inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
-    int rc = bind(s, (sockaddr*)&a, sizeof(a));
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+    connect(s, (sockaddr*)&a, sizeof(a));
+    fd_set wf, ef;
+    FD_ZERO(&wf); FD_ZERO(&ef);
+    FD_SET(s, &wf); FD_SET(s, &ef);
+    timeval tv{ 0, 200000 };
+    bool answered = false;
+    if (select(0, nullptr, &wf, &ef, &tv) > 0 && FD_ISSET(s, &wf)) {
+        int err = 0, el = sizeof(err);
+        getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &el);
+        answered = (err == 0);
+    }
     closesocket(s);
-    return rc == 0;
+    return !answered;
 }
 
 struct Child {

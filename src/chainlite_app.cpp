@@ -63,6 +63,28 @@ static bool port_free(uint16_t p) {
     return !answered;
 }
 
+// port_free() alone cannot keep two launchers apart: both probe, both see the
+// range empty, and both spawn onto it -- the probe and the bind are seconds
+// apart. Observed result was two "independent" instances (separate datadirs)
+// silently merging into one 6-node network. A named mutex makes claiming a range
+// atomic; whoever creates it first owns it until the process exits.
+static std::vector<HANDLE> g_range_claims;
+
+static bool claim_port_range(uint16_t rpc0) {
+    std::string name = strf("chainlite-portrange-%u", (unsigned)rpc0);
+    HANDLE m = CreateMutexA(nullptr, TRUE, name.c_str());
+    if (!m) return false;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(m); return false; }
+    g_range_claims.push_back(m);
+    return true;
+}
+static void release_port_range() {
+    if (g_range_claims.empty()) return;
+    ReleaseMutex(g_range_claims.back());
+    CloseHandle(g_range_claims.back());
+    g_range_claims.pop_back();
+}
+
 struct Child {
     PROCESS_INFORMATION pi{};
     HANDLE log = INVALID_HANDLE_VALUE;
@@ -90,7 +112,13 @@ static bool spawn_node(const std::string& exe, std::string cmdline,
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
         return false;
     }
-    AssignProcessToJobObject(job, pi.hProcess);
+    // The "nothing is ever orphaned" guarantee rests entirely on this call. If it
+    // fails (it can, when we are ourselves inside a job that forbids nesting) the
+    // child survives a hard kill of this process, so say so rather than pretend.
+    if (!AssignProcessToJobObject(job, pi.hProcess))
+        printf("\n   [!] could not put node in the job object (error %lu):\n"
+               "       if this launcher is killed outright, that node may outlive it.\n",
+               GetLastError());
     ResumeThread(pi.hThread);
     out.pi = pi;
     out.log = h;
@@ -149,10 +177,12 @@ static int supervise(const Args& args) {
     uint16_t p2p0 = 0, rpc0 = 0;
     for (int attempt = 0; attempt < 20 && !p2p0; attempt++) {
         uint16_t p = (uint16_t)(7501 + attempt * 10), r = (uint16_t)(8501 + attempt * 10);
+        if (!claim_port_range(r)) continue;      // a concurrent launcher owns this range
         bool ok = true;
         for (int i = 0; i < NODES; i++)
             if (!port_free((uint16_t)(p + i)) || !port_free((uint16_t)(r + i))) { ok = false; break; }
         if (ok) { p2p0 = p; rpc0 = r; }
+        else release_port_range();
     }
     if (!p2p0) {
         printf("   [!] could not find %d free port pairs starting at 7501/8501.\n", NODES);

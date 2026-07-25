@@ -17,24 +17,38 @@ if not defined VSPATH (echo [!] Visual Studio with C++ tools not found & exit /b
 call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" >nul
 :have_cl
 
+REM /utf-8 is required, not cosmetic: viewer_html.h is UTF-8 and without it MSVC
+REM transcodes string literals to the system code page (1252), silently replacing
+REM every non-Latin-1 character in the embedded web UI (warning C4566). The copy
+REM compiled into chainlite.exe would then differ from web\viewer.html.
+
 REM --- embed the web viewer into a header so binaries are self-contained ---
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\embed.ps1"
 if %errorlevel% neq 0 (echo [!] embedding viewer.html failed & exit /b 1)
 
+REM --- viewer escaping regressions (needs node; skipped when it isn't installed) ---
+where node >nul 2>nul
+if %errorlevel% equ 0 (
+    node "%ROOT%tools\test_viewer.js"
+    if errorlevel 1 (echo [!] viewer tests failed & exit /b 1)
+) else (
+    echo [i] node not found - skipping viewer JS tests
+)
+
 echo === building chainlite.exe (all-in-one portable app) ===
-cl /nologo /std:c++17 /O2 /EHsc /DNDEBUG /I"%SRC%" "%SRC%\chainlite_app.cpp" /Fe"%BIN%\chainlite.exe" /Fo"%BIN%\\" /link ws2_32.lib bcrypt.lib shell32.lib
+cl /nologo /std:c++17 /O2 /EHsc /DNDEBUG /utf-8 /I"%SRC%" "%SRC%\chainlite_app.cpp" /Fe"%BIN%\chainlite.exe" /Fo"%BIN%\\" /link ws2_32.lib bcrypt.lib shell32.lib
 if %errorlevel% neq 0 (echo [!] chainlite build failed & exit /b 1)
 
 echo === building clnode.exe ===
-cl /nologo /std:c++17 /O2 /EHsc /DNDEBUG /I"%SRC%" "%SRC%\clnode.cpp" /Fe"%BIN%\clnode.exe" /Fo"%BIN%\\" /link ws2_32.lib bcrypt.lib
+cl /nologo /std:c++17 /O2 /EHsc /DNDEBUG /utf-8 /I"%SRC%" "%SRC%\clnode.cpp" /Fe"%BIN%\clnode.exe" /Fo"%BIN%\\" /link ws2_32.lib bcrypt.lib
 if %errorlevel% neq 0 (echo [!] clnode build failed & exit /b 1)
 
 echo === building clctl.exe ===
-cl /nologo /std:c++17 /O2 /EHsc /DNDEBUG /I"%SRC%" "%SRC%\clctl.cpp" /Fe"%BIN%\clctl.exe" /Fo"%BIN%\\" /link ws2_32.lib bcrypt.lib
+cl /nologo /std:c++17 /O2 /EHsc /DNDEBUG /utf-8 /I"%SRC%" "%SRC%\clctl.cpp" /Fe"%BIN%\clctl.exe" /Fo"%BIN%\\" /link ws2_32.lib bcrypt.lib
 if %errorlevel% neq 0 (echo [!] clctl build failed & exit /b 1)
 
 echo === building cl_selftest.exe ===
-cl /nologo /std:c++17 /O2 /EHsc /DNDEBUG /I"%SRC%" "%SRC%\selftest.cpp" /Fe"%BIN%\cl_selftest.exe" /Fo"%BIN%\\" /link ws2_32.lib bcrypt.lib
+cl /nologo /std:c++17 /O2 /EHsc /DNDEBUG /utf-8 /I"%SRC%" "%SRC%\selftest.cpp" /Fe"%BIN%\cl_selftest.exe" /Fo"%BIN%\\" /link ws2_32.lib bcrypt.lib
 if %errorlevel% neq 0 (echo [!] selftest build failed & exit /b 1)
 
 if "%~1"=="gpu" (
@@ -46,6 +60,8 @@ if "%~1"=="gpu" (
 )
 :done
 echo.
-echo === build complete -> %BIN% ===
+REM ^> is escaped: a bare > here is parsed as a redirect, which tried to write to
+REM the bin directory and ended a successful build with "Access is denied."
+echo === build complete -^> %BIN% ===
 dir /b "%BIN%\*.exe"
 endlocal

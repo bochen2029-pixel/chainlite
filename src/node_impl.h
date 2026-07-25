@@ -26,7 +26,7 @@ struct App {
     bool mine_on = true;
     uint64_t heartbeat_s = 0;
     std::string webroot;     // directory holding viewer.html (served at GET /)
-    std::string rpc_peers;   // comma-separated RPC ports of the whole network, for GET /nodes
+    std::vector<uint16_t> rpc_ports;  // this network's RPC ports incl. ours, for GET /nodes + CORS
     uint16_t    rpc_port = 0;
     std::atomic<bool> running{true};
     std::atomic<uint64_t> tip_seq{0};   // bumped on every chain change; aborts the miner
@@ -109,6 +109,18 @@ static void handle_blocks(App& a, int peer, std::vector<Block>&& v) {
         }
         if (okc > 0) post_chain_change(a);
         if (!err.empty() && okc == 0 && a.sync_extend_got == 0) {
+            // Not every rejection is a fork. While this request was in flight the
+            // peer may simply have *pushed* us the same block via M_BLOCK, so the
+            // reply is now stale and connect_block says "bad height". Treating
+            // that as a divergence made the node re-download the entire chain
+            // from genesis and then discard it -- routinely, on a healthy network.
+            // Only a batch that is genuinely ahead of our tip and still won't
+            // connect indicates real divergence.
+            const Block& first = v.front();
+            if (a.chain.has_block(first.h.hash()) || first.h.height <= a.chain.height()) {
+                reset_sync(a);   // already past it; a later TIP retriggers from the new height
+                return;
+            }
             // peer's history diverges from ours -> download their whole chain and compare work
             logl("sync", strf("fork detected vs %s (%s) - downloading full candidate chain",
                               a.p2p.peer_label(peer).c_str(), err.c_str()));
@@ -175,16 +187,12 @@ static void wire_p2p(App& a) {
             uint64_t start; uint32_t cnt;
             try { Reader r(payload); start = r.u64(); cnt = r.u32(); }
             catch (...) { break; }
-            cnt = std::min(cnt, 200u);
-            Writer w;
-            std::lock_guard<std::mutex> g(a.mtx);
-            uint64_t n = 0;
-            std::vector<bytes> raws;
-            for (uint64_t h = start; h < a.chain.blocks.size() && n < cnt; h++, n++)
-                raws.push_back(a.chain.blocks[h].serialize());
-            w.u32((uint32_t)raws.size());
-            for (auto& r2 : raws) { w.u32((uint32_t)r2.size()); w.blob(r2); }
-            a.p2p.send_to(peer, M_BLOCKS, w.b);
+            bytes out;
+            {
+                std::lock_guard<std::mutex> g(a.mtx);
+                out = build_blocks_payload(a.chain.blocks, start, cnt);
+            }
+            a.p2p.send_to(peer, M_BLOCKS, out);
             break;
         }
         case M_BLOCKS: {
@@ -402,7 +410,17 @@ static HttpResp handle_rpc(App& a, const HttpReq& r) {
     if (r.path == "/" || r.path == "/app" || r.path == "/viewer.html") {
         std::string html = a.webroot.empty() ? "" : read_file(a.webroot + "\\viewer.html");
         if (html.empty()) html = viewer_html();
-        if (!html.empty()) return { 200, "text/html; charset=utf-8", html };
+        // The page holds a spendable key in localStorage, so cap the blast radius
+        // of any future markup bug: no remote script/style/image, and network
+        // access limited to loopback. Even a working XSS then cannot ship the key
+        // off the machine. ('unsafe-inline' is unavoidable while the page uses
+        // inline <script> and onclick handlers.)
+        const char* csp = "default-src 'none'; script-src 'unsafe-inline'; "
+                          "style-src 'unsafe-inline'; img-src data:; "
+                          "connect-src http://127.0.0.1:* http://localhost:*; "
+                          "base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+        if (!html.empty())
+            return { 200, "text/html; charset=utf-8", html, {{ "Content-Security-Policy", csp }} };
         return { 200, "text/plain",
             "chainlite node RPC (no web viewer embedded or found)\n"
             "Endpoints: GET /help for the list.\n" };
@@ -426,18 +444,12 @@ static HttpResp handle_rpc(App& a, const HttpReq& r) {
 
     // Lets the web viewer discover its sibling nodes instead of assuming 8501-8503,
     // so a launcher that shifts ports (e.g. when the defaults are taken) still works.
+    // rpc_ports was validated as numeric at startup, so this cannot inject
+    // arbitrary text into the JSON the viewer parses and renders.
     if (r.path == "/nodes") {
         std::string list;
-        std::string src = a.rpc_peers.empty() ? std::to_string(a.rpc_port) : a.rpc_peers;
-        size_t pos = 0;
-        bool first = true;
-        while (pos < src.size()) {
-            size_t c = src.find(',', pos);
-            if (c == std::string::npos) c = src.size();
-            std::string t = src.substr(pos, c - pos);
-            if (!t.empty()) { list += (first ? "" : ",") + t; first = false; }
-            pos = c + 1;
-        }
+        for (size_t i = 0; i < a.rpc_ports.size(); i++)
+            list += (i ? "," : "") + std::to_string(a.rpc_ports[i]);
         return { 200, "application/json",
                  strf("{\"self\":%u,\"rpc\":[%s]}", a.rpc_port, list.c_str()) };
     }
@@ -469,8 +481,8 @@ static HttpResp handle_rpc(App& a, const HttpReq& r) {
             if (h < a.chain.blocks.size()) b = &a.chain.blocks[h];
         } else if (r.query.count("hash")) {
             auto want = unhex_n<32>(r.query.at("hash"));
-            if (want) for (size_t i = 0; i < a.chain.hashes.size(); i++)
-                if (a.chain.hashes[i] == *want) { b = &a.chain.blocks[i]; break; }
+            long long h = want ? a.chain.height_of(*want) : -1;   // indexed, was a full scan
+            if (h >= 0 && (size_t)h < a.chain.blocks.size()) b = &a.chain.blocks[(size_t)h];
         }
         if (!b) return err404("block not found");
         std::string txids;
@@ -674,8 +686,24 @@ inline int node_run(const Args& args) {
         exedir = (sl == std::string::npos) ? "." : exedir.substr(0, sl);
         a.webroot = args.get("webroot", exedir + "\\..\\web");
     }
-    a.rpc_port  = rpc_port;
-    a.rpc_peers = args.get("rpc-peers", "");
+    a.rpc_port = rpc_port;
+    {   // --rpc-peers is a comma-separated port list; accept only real port
+        // numbers so nothing else can reach GET /nodes (and the viewer's DOM).
+        a.rpc_ports.push_back(rpc_port);
+        std::string src = args.get("rpc-peers", "");
+        size_t pos = 0;
+        while (pos < src.size()) {
+            size_t c = src.find(',', pos);
+            if (c == std::string::npos) c = src.size();
+            std::string t = src.substr(pos, c - pos);
+            pos = c + 1;
+            if (t.empty() || t.find_first_not_of("0123456789") != std::string::npos) continue;
+            unsigned long v = strtoul(t.c_str(), nullptr, 10);
+            if (v == 0 || v > 65535) continue;
+            if (std::find(a.rpc_ports.begin(), a.rpc_ports.end(), (uint16_t)v) == a.rpc_ports.end())
+                a.rpc_ports.push_back((uint16_t)v);
+        }
+    }
     std::vector<std::string> peers;
     {
         std::string ps = args.get("peers", "");
@@ -729,6 +757,9 @@ inline int node_run(const Args& args) {
         return 1;
     }
     a.rpc.handler = [&a](const HttpReq& r) { return handle_rpc(a, r); };
+    // Only our own network's node origins may read us cross-origin; every other
+    // site gets no CORS header and so cannot see any response body.
+    a.rpc.sibling_ports.insert(a.rpc_ports.begin(), a.rpc_ports.end());
     if (!a.rpc.start(rpc_port)) {
         logl("fatal", strf("could not listen on rpc port %u (already in use?)", rpc_port));
         return 1;

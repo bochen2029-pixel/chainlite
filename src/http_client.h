@@ -17,8 +17,12 @@ inline int http_req(const std::string& host, uint16_t port, const std::string& m
     if (inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) { closesocket(s); return -1; }
     if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) { closesocket(s); return -1; }
 
-    std::string req = strf("%s %s HTTP/1.1\r\nHost: %s:%u\r\nContent-Length: %zu\r\n"
-                           "Connection: close\r\n\r\n",
+    // X-Chainlite marks this as a first-party (non-browser) caller; the node
+    // requires it on POST so a drive-by page cannot submit transactions. A
+    // browser can only set a custom header after a preflight, which the node
+    // grants to sibling-node origins alone.
+    std::string req = strf("%s %s HTTP/1.1\r\nHost: %s:%u\r\nX-Chainlite: 1\r\n"
+                           "Content-Length: %zu\r\nConnection: close\r\n\r\n",
                            method.c_str(), path.c_str(), host.c_str(), (unsigned)port, body.size()) + body;
     size_t off = 0;
     while (off < req.size()) {

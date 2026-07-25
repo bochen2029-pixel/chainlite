@@ -48,7 +48,8 @@ can die) — bump the peer list to 4+ for f=1 BFT.
 **`chainlite.exe` is a complete blockchain in a single portable binary.** Copy that
 one file anywhere — a USB stick, a fresh machine — double-click it, and it:
 
-1. picks a free range of ports (so it never collides with another instance),
+1. claims a free range of ports (a named mutex reserves the range before the
+   probe, so two instances started at the same moment cannot pick the same one),
 2. spawns **three real validating node processes**,
 3. waits for them to come up and opens the notes UI in your browser,
 4. keeps the chain in `chainlite-data\` next to the exe.
@@ -99,9 +100,13 @@ build-gpu.bat        :: builds ONLY the CUDA miner (safe while nodes are running
 `web\viewer.html` next to it, it serves that instead — so editing the page during
 development hot-reloads with a browser refresh, no rebuild needed.
 
+`build.bat` also runs `tools\test_viewer.js` (skipped if `node` isn't installed),
+which checks the viewer's HTML escaping against the real `web\viewer.html`.
+
 Run the self-test first — it checks SHA-256 against the official NIST vectors,
-signatures, Merkle proofs, serialization, chain validation, the mempool, and a
-full reorg:
+signatures, Merkle proofs, serialization, chain validation, the mempool, a full
+reorg, and the network/RPC layers: P2P framing and the `M_BLOCKS` byte budget,
+the RPC's Host/CORS/CSRF rules, and the `/records` notes feed:
 
 ```bat
 bin\cl_selftest.exe
@@ -248,6 +253,29 @@ deliberate simplification for a controlled local chain).
 `POST /submit /submitwork`. Any language that can do an HTTP GET can read the
 ledger; `curl http://127.0.0.1:8501/status`.
 
+**Binding to loopback is not by itself protection from the web.** Every page you
+visit can issue requests to `127.0.0.1`, so the RPC enforces three rules:
+
+- **`Host:` must be loopback.** Blocks DNS rebinding, where an attacker's domain
+  re-resolves to `127.0.0.1` so their page counts as same-origin and skips CORS.
+- **CORS is allow-listed, never `*`.** `Access-Control-Allow-Origin` is echoed
+  only for this network's own node ports (so the viewer on `:8501` can still poll
+  `:8502`/`:8503`). Any other site gets no CORS header and cannot read a response.
+- **Writes need an `X-Chainlite` header.** CORS does *not* stop a cross-origin
+  `POST` from being delivered — a `text/plain` body is a "simple request" that
+  needs no preflight. Requiring a custom header does, because setting one forces
+  a preflight, which is answered only for allow-listed origins.
+
+Reading from a script is unaffected (`curl` sends no `Origin`). Posting from one
+needs the header — `clctl` and the GPU miner send it automatically:
+
+```bat
+curl -H "X-Chainlite: 1" --data-binary "<hex tx>" http://127.0.0.1:8501/submit
+```
+
+The viewer is also served with a Content-Security-Policy that pins network access
+to loopback, so a future markup bug can't ship your wallet key off the machine.
+
 `GET /records?limit=N[&addr=<hex40>]` is the notes feed: every `RECORD` transaction
 newest-first, with pending (mempool) ones listed ahead of confirmed. Payloads come back
 as hex, so arbitrary note text needs no escaping —
@@ -258,9 +286,30 @@ as hex, so arbitrary note text needs no escaping —
 ## Notes & honest limitations
 
 - Keys are stored in plaintext (`node.key`, `wallet.key`) — this is a local toy
-  wallet, not key management. Don't reuse these keys anywhere real.
+  wallet, not key management. Don't reuse these keys anywhere real. The browser
+  wallet keeps an *extractable* key in `localStorage` for the same reason.
 - No difficulty retargeting, no transaction fees, no mempool eviction policy beyond
   a size cap, no wire encryption (loopback).
+- **Addresses have no checksum.** They are `sha256(pubkey)[:20]`, so a mistyped
+  `--to` is a valid-looking address nobody holds the key for, and the coin is
+  gone. Copy/paste, don't retype.
+- **Block timestamps are only checked against future skew** (2 h), not for
+  monotonicity. A miner can backdate a block, which scrambles the notes feed's
+  ordering. The obvious fix — requiring `time >= prev.time` — is deliberately
+  *not* applied: with no median-time-past rule, a single backwards clock step
+  (NTP correction) would make a node mine blocks its peers reject and stall the
+  chain. Doing it properly means Bitcoin-style median-time-past over the last 11
+  blocks.
+- **ECDSA signatures are malleable**, so txids are too: re-signing a pending tx
+  with `s -> n-s` yields a different txid for the same transfer. The mempool's
+  (sender, nonce) key stops it becoming a double-spend, but a `proof.txt` saved
+  for the original txid is orphaned if the malleated twin gets mined instead.
+  Enforcing low-`s` would reject any already-confirmed high-`s` transaction, so
+  it needs a planned migration rather than a flag flip.
+- **No coinbase maturity.** A miner can spend a reward immediately. If a reorg
+  erases that reward, the spending tx stays in the mempool (its nonce is still
+  unused) and can never be mined — it lingers until it is pushed out by the
+  10,000-tx cap.
 - Three nodes = crash-fault tolerant, not Byzantine. All three share one admin
   (you), so "decentralization" here is a lab property, not a trust model.
 - What it *is* genuinely good for locally: a tamper-evident, self-healing,

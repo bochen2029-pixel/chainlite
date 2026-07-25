@@ -1,10 +1,59 @@
 // chainlite self-test: FIPS 180-4 SHA-256 vectors, CNG signatures, merkle
-// proofs, tx/block serialization, chain validation, mempool rules, and reorgs.
+// proofs, tx/block serialization, chain validation, mempool rules, and reorgs,
+// plus the P2P framing / RPC-security / notes-feed regressions below.
 #include "common.h"
 #include "core.h"
+#include "net.h"
+#include "node_impl.h"     // for handle_rpc() — exercises /records, /submit, /block
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
+
+// Raw HTTP request against a local RpcServer; returns the whole response text.
+static std::string http_raw(uint16_t port, const std::string& req) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return "";
+    DWORD tmo = 4000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tmo, sizeof(tmo));
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+    if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) { closesocket(s); return ""; }
+    send(s, req.data(), (int)req.size(), 0);
+    std::string out;
+    char buf[8192];
+    for (;;) {
+        int n = recv(s, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        out.append(buf, n);
+    }
+    closesocket(s);
+    return out;
+}
+static bool has_line(const std::string& resp, const std::string& needle) {
+    return resp.find(needle) != std::string::npos;
+}
+// A block carrying `ntx` RECORD txs of `payload` bytes each. Not consensus-valid
+// (signatures are junk) — used only to measure wire sizes.
+static Block bulky_block(uint64_t height, size_t ntx, size_t payload) {
+    Block b;
+    b.h.version = CL_VERSION;
+    b.h.height = height;
+    b.h.time = 1753000000;
+    Tx cb; cb.type = TX_COINBASE; cb.nonce = height;
+    b.txs.push_back(cb);
+    for (size_t i = 1; i < ntx; i++) {
+        Tx t;
+        t.type = TX_RECORD;
+        t.nonce = i;
+        t.from.fill((uint8_t)i);
+        t.payload.assign(payload, (uint8_t)i);
+        b.txs.push_back(t);
+    }
+    return b;
+}
 
 static Block mine_block(const Chain& c, const Params& p, const Addr20& miner,
                         std::vector<Tx> txs, uint64_t t) {
@@ -45,6 +94,9 @@ static Tx make_transfer(const KeyPair& from, const Addr20& to, uint64_t amount,
 }
 
 int main() {
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);   // the P2P/RPC regressions below use sockets
+
     // --- SHA-256 against official vectors ---
     CHECK(hexs(sha256(std::string(""))) ==
           "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
@@ -227,6 +279,390 @@ int main() {
         Block wb = mine_block(worse, p, A, {}, t0 + 50);
         CHECK(worse.connect_block(wb).empty());
         CHECK(!c.try_replace(worse.blocks, &fork).empty());
+    }
+
+    // ================= regressions =================
+
+    // --- block-hash index (has_block / height_of) stays correct across a reorg ---
+    {
+        Chain h; h.params = p;
+        CHECK(h.init(nullptr).empty());
+        std::vector<H256> made;
+        for (int i = 0; i < 4; i++) {
+            Block b = mine_block(h, p, A, {}, t0 + 100 + i);
+            CHECK(h.connect_block(b).empty());
+            made.push_back(b.h.hash());
+        }
+        for (size_t i = 0; i < made.size(); i++) {
+            CHECK(h.has_block(made[i]));
+            CHECK(h.height_of(made[i]) == (long long)(i + 1));
+        }
+        H256 nope{}; nope.fill(0x9e);
+        CHECK(!h.has_block(nope));
+        CHECK(h.height_of(nope) == -1);
+        CHECK(h.has_block(h.hashes[0]) && h.height_of(h.hashes[0]) == 0);   // genesis
+        // after a reorg the index must describe the NEW chain, not the old one
+        Chain alt2; alt2.params = p;
+        CHECK(alt2.init(nullptr).empty());
+        for (int i = 0; i < 6; i++) {
+            Block b = mine_block(alt2, p, B, {}, t0 + 200 + i);
+            CHECK(alt2.connect_block(b).empty());
+        }
+        uint64_t fk = 0;
+        CHECK(h.try_replace(alt2.blocks, &fk).empty());
+        for (auto& old : made) CHECK(!h.has_block(old));          // orphaned
+        for (size_t i = 1; i < alt2.hashes.size(); i++)
+            CHECK(h.height_of(alt2.hashes[i]) == (long long)i);   // adopted
+        CHECK(h.hashidx.size() == h.hashes.size());
+    }
+
+    // --- mempool lookup by txid (indexed, not a rescan) ---
+    {
+        Mempool mp;
+        Tx t1 = make_transfer(*kA, B, 1, 0, p);
+        CHECK(mp.add(t1, State{}, p).empty() || true);
+        State fund;
+        fund[A].balance = 100;
+        Mempool mp2;
+        Tx t2 = make_transfer(*kA, B, 5, 0, p);
+        CHECK(mp2.add(t2, fund, p).empty());
+        CHECK(mp2.has(t2.txid()));
+        auto got = mp2.find(t2.txid());
+        CHECK(got && got->txid() == t2.txid());
+        H256 miss{}; miss.fill(0x11);
+        CHECK(!mp2.has(miss));
+        CHECK(!mp2.find(miss));
+        mp2.purge(fund);                       // nonce 0 still pending -> stays
+        CHECK(mp2.size() == 1 && mp2.has(t2.txid()));
+        State spent = fund;
+        spent[A].nonce = 1;
+        mp2.purge(spent);                      // now consumed -> both indexes drop it
+        CHECK(mp2.size() == 0);
+        CHECK(!mp2.has(t2.txid()) && !mp2.find(t2.txid()));
+    }
+
+    // --- collect() skips signature checks, but consensus must NOT ---
+    // (guards the optimisation that stopped the miner starving the RPC)
+    {
+        State fund;
+        fund[A].balance = 1000;
+        Mempool mp;
+        Tx good = make_transfer(*kA, B, 7, 0, p);
+        CHECK(mp.add(good, fund, p).empty());
+        CHECK(mp.collect(fund, p, 1).size() == 1);
+        // forge a bad signature straight into the pool, bypassing add()
+        Tx forged = make_transfer(*kA, B, 9, 1, p);
+        forged.sig[3] ^= 0xFF;
+        mp.m[{ A, 1 }] = forged;
+        mp.ids[forged.txid()] = { A, 1 };
+        // collect() trusts the pool, so it may well hand the forgery back...
+        auto sel2 = mp.collect(fund, p, 1);
+        CHECK(sel2.size() >= 1);
+        // ...but connect_block must still reject it. This is the security-critical half.
+        Chain cs; cs.params = p;
+        CHECK(cs.init(nullptr).empty());
+        Block fb = mine_block(cs, p, A, { forged }, t0 + 300);
+        CHECK(!cs.connect_block(fb).empty());
+        // and apply_tx with the default (verify_sig=true) rejects it directly.
+        // nonce must already match, so the signature is the ONLY thing that can fail.
+        State chk;
+        chk[A].balance = 1000;
+        chk[A].nonce = forged.nonce;
+        CHECK(apply_tx(chk, forged, p, 1, false) == "bad signature");
+        State chk2 = chk;
+        CHECK(apply_tx(chk2, forged, p, 1, false, /*verify_sig=*/false).empty());
+    }
+
+    // --- M_BLOCKS batching stays inside the receiver's frame cap ---
+    // Regression: 200 blocks x ~1.14 MB produced a 13.7 MB frame; the peer that
+    // asked for it dropped the connection and could never finish syncing.
+    {
+        CHECK(MAX_BLOCKS_PAYLOAD < MAX_FRAME_BYTES);
+        // a single maximum-size block must still fit in one frame, or sync deadlocks
+        Block maxb = bulky_block(1, MAX_BLOCK_TXS, MAX_PAYLOAD);
+        size_t maxsz = maxb.serialize().size();
+        CHECK(maxsz + 8 < MAX_FRAME_BYTES);
+
+        std::vector<Block> big;
+        big.push_back(bulky_block(0, 1, 0));
+        for (uint64_t i = 1; i <= 30; i++) big.push_back(bulky_block(i, 1001, MAX_PAYLOAD));
+        bytes pay = build_blocks_payload(big, 1, 200);
+        CHECK(pay.size() <= MAX_FRAME_BYTES);
+        CHECK(pay.size() <= MAX_BLOCKS_PAYLOAD);
+        Reader rr(pay);
+        uint32_t got = rr.u32();
+        CHECK(got >= 1);                      // must always make progress
+        CHECK(got < 30);                      // and must have stopped early on bytes
+        for (uint32_t i = 0; i < got; i++) {  // payload stays well-formed
+            uint32_t len = rr.u32();
+            auto blk = Block::parse(rr.blob(len));
+            CHECK(blk.has_value());
+        }
+        CHECK(rr.remaining() == 0);
+
+        // one block bigger than the budget still gets sent on its own
+        std::vector<Block> one;
+        one.push_back(bulky_block(0, 1, 0));
+        one.push_back(maxb);
+        bytes solo = build_blocks_payload(one, 1, 200);
+        Reader r2(solo);
+        CHECK(r2.u32() == 1);
+        CHECK(solo.size() <= MAX_FRAME_BYTES);
+
+        // small blocks still batch up to the count limit
+        std::vector<Block> small;
+        for (uint64_t i = 0; i <= 400; i++) small.push_back(bulky_block(i, 2, 8));
+        Reader r3(build_blocks_payload(small, 1, 200));
+        CHECK(r3.u32() == MAX_BLOCKS_PER_BATCH);
+        // and asking past the tip yields an empty, valid payload
+        Reader r4(build_blocks_payload(small, 9999, 200));
+        CHECK(r4.u32() == 0);
+    }
+
+    // --- P2P: a budgeted batch is delivered; an over-cap frame kills the link ---
+    {
+        P2P n1, n2;
+        std::atomic<int> ready1{ -1 };
+        std::atomic<int> msgs{ 0 }, gone{ 0 };
+        std::atomic<size_t> lastsz{ 0 };
+        n2.on_msg = [&](int, uint8_t t, bytes&& pl) {
+            if (t == M_BLOCKS) { lastsz = pl.size(); msgs++; }
+        };
+        n2.on_gone = [&](int) { gone++; };
+        n1.on_ready = [&](int id) { ready1 = id; };
+        CHECK(n2.start(7846, {}, 0x4C495445));
+        CHECK(n1.start(7845, { "127.0.0.1:7846" }, 0x4C495445));
+        for (int i = 0; i < 120 && ready1 < 0; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        CHECK(ready1 >= 0);
+        if (ready1 >= 0) {
+            std::vector<Block> big;
+            big.push_back(bulky_block(0, 1, 0));
+            for (uint64_t i = 1; i <= 30; i++) big.push_back(bulky_block(i, 1001, MAX_PAYLOAD));
+            bytes pay = build_blocks_payload(big, 1, 200);
+            n1.send_to(ready1, M_BLOCKS, pay);
+            for (int i = 0; i < 200 && msgs == 0; i++)
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            CHECK(msgs == 1);                 // the budgeted batch gets through
+            CHECK(lastsz == pay.size());
+            CHECK(gone == 0);                 // and the link survives
+        }
+        n1.stop();
+        n2.stop();
+    }
+
+    // --- a peer that connects but never says HELLO must be reaped ---
+    // Regression: such a link stayed in the peer map forever, holding a socket
+    // and up to 16 MB of buffer, with nothing to time it out.
+    {
+        P2P n;
+        CHECK(n.start(7848, {}, 0x4C495445));
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        CHECK(s != INVALID_SOCKET);
+        sockaddr_in sa{};
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(7848);
+        inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+        CHECK(connect(s, (sockaddr*)&sa, sizeof(sa)) == 0);
+        // never send HELLO; the node greets us and then waits
+        CHECK(n.ready_count() == 0);
+        // it must hang up on us within the handshake timeout (+ slack)
+        DWORD tmo = (DWORD)HANDSHAKE_TIMEOUT_MS + 8000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
+        char buf[512];
+        int total = 0, n2;
+        while ((n2 = recv(s, buf, sizeof(buf), 0)) > 0) total += n2;
+        CHECK(n2 == 0);            // clean close by the node == it reaped us
+        CHECK(total > 0);          // (it did send us its own HELLO first)
+        CHECK(n.ready_count() == 0);
+        closesocket(s);
+        n.stop();
+    }
+
+    // --- RPC security: Host allow-list, CORS allow-list, CSRF header ---
+    {
+        RpcServer rs;
+        rs.sibling_ports = { 8791, 8792 };
+        rs.handler = [](const HttpReq& r) -> HttpResp {
+            if (r.method == "POST") return { 200, "application/json", "{\"posted\":true}" };
+            return { 200, "application/json", "{\"secret\":\"notes\"}" };
+        };
+        CHECK(rs.start(8791));
+        const std::string L = "\r\n";
+        auto REQ = [&](const std::string& s) { return http_raw(8791, s); };
+
+        // 1. same-origin / no Origin: served, and no ACAO is emitted
+        std::string r1 = REQ("GET /x HTTP/1.1" + L + "Host: 127.0.0.1:8791" + L + "Connection: close" + L + L);
+        CHECK(has_line(r1, "200 OK"));
+        CHECK(!has_line(r1, "Access-Control-Allow-Origin"));
+
+        // 2. hostile origin: refused, and never granted CORS
+        std::string r2 = REQ("GET /x HTTP/1.1" + L + "Host: 127.0.0.1:8791" + L +
+                             "Origin: https://evil.example" + L + "Connection: close" + L + L);
+        CHECK(has_line(r2, "403 Forbidden"));
+        CHECK(!has_line(r2, "Access-Control-Allow-Origin"));
+        CHECK(!has_line(r2, "secret"));
+        // the wildcard that let any website read the chain must never come back
+        CHECK(!has_line(r2, "Access-Control-Allow-Origin: *"));
+        CHECK(!has_line(r1, "Access-Control-Allow-Origin: *"));
+
+        // 3. a sibling node origin: allowed, echoed exactly (not "*")
+        std::string r3 = REQ("GET /x HTTP/1.1" + L + "Host: 127.0.0.1:8791" + L +
+                             "Origin: http://127.0.0.1:8792" + L + "Connection: close" + L + L);
+        CHECK(has_line(r3, "200 OK"));
+        CHECK(has_line(r3, "Access-Control-Allow-Origin: http://127.0.0.1:8792"));
+        CHECK(has_line(r3, "Vary: Origin"));
+
+        // 4. a loopback port that is NOT one of our nodes: no CORS
+        std::string r4 = REQ("GET /x HTTP/1.1" + L + "Host: 127.0.0.1:8791" + L +
+                             "Origin: http://127.0.0.1:9999" + L + "Connection: close" + L + L);
+        CHECK(has_line(r4, "403 Forbidden"));
+        CHECK(!has_line(r4, "Access-Control-Allow-Origin"));
+
+        // 5. DNS rebinding: attacker domain in Host is refused
+        std::string r5 = REQ("GET /x HTTP/1.1" + L + "Host: chainlite.evil.example" + L +
+                             "Connection: close" + L + L);
+        CHECK(has_line(r5, "403 Forbidden"));
+        CHECK(!has_line(r5, "secret"));
+        CHECK(has_line(REQ("GET /x HTTP/1.1" + L + "Host: localhost:8791" + L +
+                           "Connection: close" + L + L), "200 OK"));
+
+        // 6. drive-by POST (a CORS "simple request") is blocked without the header
+        std::string r6 = REQ("POST /submit HTTP/1.1" + L + "Host: 127.0.0.1:8791" + L +
+                             "Content-Type: text/plain" + L + "Content-Length: 2" + L +
+                             "Connection: close" + L + L + "hi");
+        CHECK(has_line(r6, "403 Forbidden"));
+        CHECK(!has_line(r6, "posted"));
+        // ...and allowed for a first-party caller that sets it
+        std::string r7 = REQ("POST /submit HTTP/1.1" + L + "Host: 127.0.0.1:8791" + L +
+                             "X-Chainlite: 1" + L + "Content-Type: text/plain" + L +
+                             "Content-Length: 2" + L + "Connection: close" + L + L + "hi");
+        CHECK(has_line(r7, "200 OK"));
+        CHECK(has_line(r7, "posted"));
+
+        // 7. every response's Content-Length must equal its actual body length.
+        // Regression: the Host-rejection response hard-coded 61 for a 54-byte body,
+        // which leaves a conforming client waiting on 7 bytes that never arrive.
+        auto body_len_ok = [](const std::string& resp) {
+            size_t he = resp.find("\r\n\r\n");
+            if (he == std::string::npos) return false;
+            std::string head = resp.substr(0, he);
+            std::string lower = head;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char ch) { return (char)tolower(ch); });
+            size_t p = lower.find("content-length:");
+            if (p == std::string::npos) return false;
+            size_t want = (size_t)atoll(lower.c_str() + p + 15);
+            return resp.size() - (he + 4) == want;
+        };
+        CHECK(body_len_ok(REQ("GET /x HTTP/1.1" + L + "Host: 127.0.0.1:8791" + L + "Connection: close" + L + L)));
+        CHECK(body_len_ok(REQ("GET /x HTTP/1.1" + L + "Host: evil.example" + L + "Connection: close" + L + L)));
+        CHECK(body_len_ok(REQ("GET /x HTTP/1.1" + L + "Host: 127.0.0.1:8791" + L +
+                              "Origin: https://evil.example" + L + "Connection: close" + L + L)));
+        CHECK(body_len_ok(REQ("POST /submit HTTP/1.1" + L + "Host: 127.0.0.1:8791" + L +
+                              "Content-Type: text/plain" + L + "Content-Length: 2" + L +
+                              "Connection: close" + L + L + "hi")));
+
+        // 8. preflight only for siblings
+        CHECK(has_line(REQ("OPTIONS /submit HTTP/1.1" + L + "Host: 127.0.0.1:8791" + L +
+                           "Origin: http://127.0.0.1:8792" + L + "Connection: close" + L + L),
+                       "204 No Content"));
+        CHECK(has_line(REQ("OPTIONS /submit HTTP/1.1" + L + "Host: 127.0.0.1:8791" + L +
+                           "Origin: https://evil.example" + L + "Connection: close" + L + L),
+                       "403 Forbidden"));
+        rs.stop();
+    }
+
+    // --- origin / host parsing helpers ---
+    {
+        CHECK(loopback_origin_port("http://127.0.0.1:8501") == 8501);
+        CHECK(loopback_origin_port("http://localhost:65535") == 65535);
+        CHECK(loopback_origin_port("https://127.0.0.1:8501") == 0);   // https must not reach us
+        CHECK(loopback_origin_port("http://127.0.0.1.evil.com:8501") == 0);
+        CHECK(loopback_origin_port("http://127.0.0.1:8501.evil") == 0);
+        CHECK(loopback_origin_port("http://127.0.0.1:0") == 0);
+        CHECK(loopback_origin_port("http://127.0.0.1:99999") == 0);
+        CHECK(loopback_origin_port("null") == 0);                     // file:// pages
+        CHECK(loopback_origin_port("") == 0);
+        CHECK(loopback_host("127.0.0.1:8501") && loopback_host("localhost"));
+        CHECK(loopback_host("[::1]:8501"));
+        CHECK(!loopback_host("evil.example") && !loopback_host(""));
+        CHECK(!loopback_host("127.0.0.1.evil.example"));
+        CHECK(!loopback_host("localhost.evil.example"));
+    }
+
+    // --- /records notes feed (previously untested) ---
+    {
+        App app;
+        app.params = p;
+        app.chain.params = p;
+        CHECK(app.chain.init(nullptr).empty());
+        Addr20 me = addr_of(kA->pub);
+        // fund kA so it can pay the RECORD nonces
+        Block f1 = mine_block(app.chain, p, me, {}, t0 + 400);
+        CHECK(app.chain.connect_block(f1).empty());
+
+        auto rec = [&](const std::string& text, uint64_t nonce) {
+            Tx t;
+            t.type = TX_RECORD; t.net_id = p.net_id; t.from = kA->pub;
+            t.nonce = nonce;
+            t.payload.assign(text.begin(), text.end());
+            t.sig = *kp_sign(*kA, t.sign_hash());
+            return t;
+        };
+        Tx r1 = rec("hello notes", 0), r2 = rec("second note", 1);
+        Block b = mine_block(app.chain, p, me, { r1, r2 }, t0 + 401);
+        CHECK(app.chain.connect_block(b).empty());
+
+        HttpReq q;
+        q.method = "GET"; q.path = "/records";
+        HttpResp resp = handle_rpc(app, q);
+        CHECK(resp.code == 200);
+        // payloads are hex so arbitrary note text needs no JSON escaping
+        const std::string note1 = "hello notes";
+        CHECK(has_line(resp.body, hexs(bytes(note1.begin(), note1.end()))));
+        CHECK(has_line(resp.body, hexs(r2.txid())));
+        CHECK(has_line(resp.body, "\"confirmed\""));
+        CHECK(has_line(resp.body, "\"from\":\"" + hexs(me) + "\""));
+        // newest-first
+        CHECK(resp.body.find(hexs(r2.txid())) < resp.body.find(hexs(r1.txid())));
+        // limit is honoured
+        q.query["limit"] = "1";
+        HttpResp lim = handle_rpc(app, q);
+        CHECK(lim.body.find(hexs(r1.txid())) == std::string::npos);
+        // addr filter: a stranger's address matches nothing
+        q.query.erase("limit");
+        q.query["addr"] = hexs(addr_of(kB->pub));
+        CHECK(handle_rpc(app, q).body == "{\"records\":[]}");
+        q.query["addr"] = "nothex";
+        CHECK(handle_rpc(app, q).code == 400);
+
+        // a note whose bytes are hostile HTML still comes back as inert hex
+        Tx evil = rec("<svg onload=alert()>", 2);
+        Block eb = mine_block(app.chain, p, me, { evil }, t0 + 402);
+        CHECK(app.chain.connect_block(eb).empty());
+        HttpReq q2;
+        q2.method = "GET"; q2.path = "/records";
+        HttpResp er = handle_rpc(app, q2);
+        CHECK(!has_line(er.body, "<svg"));
+        CHECK(has_line(er.body, "3c737667206f6e6c6f61643d616c65727428293e"));
+
+        // /nodes must emit only validated numeric ports
+        app.rpc_port = 8501;
+        app.rpc_ports = { 8501, 8502 };
+        HttpReq q3;
+        q3.method = "GET"; q3.path = "/nodes";
+        CHECK(handle_rpc(app, q3).body == "{\"self\":8501,\"rpc\":[8501,8502]}");
+
+        // and the served page carries a CSP that pins network access to loopback
+        HttpReq q4;
+        q4.method = "GET"; q4.path = "/";
+        HttpResp page = handle_rpc(app, q4);
+        bool csp = false;
+        for (auto& kv : page.extra)
+            if (kv.first == "Content-Security-Policy" &&
+                kv.second.find("connect-src http://127.0.0.1:*") != std::string::npos) csp = true;
+        CHECK(csp);
     }
 
     printf(fails ? "\nSELFTEST: %d FAILURE(S)\n" : "\nSELFTEST: ALL PASS\n", fails);

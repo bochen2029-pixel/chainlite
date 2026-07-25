@@ -406,6 +406,7 @@ static HttpResp handle_rpc(App& a, const HttpReq& r) {
             "  GET  /block?height=N | /block?hash=<hex64>\n"
             "  GET  /tx?id=<hex64>\n"
             "  GET  /mempool\n"
+            "  GET  /records?limit=N[&addr=<hex40>]   (notes feed: every RECORD tx)\n"
             "  GET  /tail?n=N\n"
             "  GET  /prove?txid=<hex64>          (merkle inclusion proof)\n"
             "  POST /submit        body=<hex tx>\n"
@@ -486,6 +487,47 @@ static HttpResp handle_rpc(App& a, const HttpReq& r) {
         }
         return { 200, "application/json",
                  strf("{\"count\":%zu,\"txids\":[", a.pool.size()) + ids + "]}" };
+    }
+    // Every RECORD tx (the "notes" feed), newest first. Pending mempool records are
+    // listed ahead of confirmed ones so a just-posted note shows up immediately.
+    // Payloads are returned as hex, so arbitrary note text needs no JSON escaping.
+    if (r.path == "/records") {
+        uint64_t limit = r.query.count("limit") ? strtoull(r.query.at("limit").c_str(), nullptr, 10) : 50;
+        if (limit == 0 || limit > 500) limit = 500;
+        std::optional<Addr20> only;
+        if (r.query.count("addr")) {
+            auto ad = unhex_n<20>(r.query.at("addr"));
+            if (!ad) return err400("bad addr");
+            only = *ad;
+        }
+        std::string out = "{\"records\":[";
+        size_t n = 0;
+        auto emit = [&](const Tx& t, const char* status, uint64_t height, uint64_t time, uint64_t conf) {
+            if (n) out += ",";
+            out += strf("{\"txid\":\"%s\",\"status\":\"%s\",\"height\":%llu,\"time\":%llu,"
+                        "\"confirmations\":%llu,\"from\":\"%s\",\"payload_hex\":\"%s\"}",
+                        hexs(t.txid()).c_str(), status, (unsigned long long)height,
+                        (unsigned long long)time, (unsigned long long)conf,
+                        hexs(addr_of(t.from)).c_str(), hexs(t.payload).c_str());
+            n++;
+        };
+        for (auto& kv : a.pool.m) {
+            if (n >= limit) break;
+            const Tx& t = kv.second;
+            if (t.type != TX_RECORD) continue;
+            if (only && addr_of(t.from) != *only) continue;
+            emit(t, "pending", 0, 0, 0);
+        }
+        for (size_t h = a.chain.blocks.size(); h-- > 0 && n < limit; ) {
+            const Block& b = a.chain.blocks[h];
+            for (size_t i = b.txs.size(); i-- > 0 && n < limit; ) {
+                const Tx& t = b.txs[i];
+                if (t.type != TX_RECORD) continue;
+                if (only && addr_of(t.from) != *only) continue;
+                emit(t, "confirmed", b.h.height, b.h.time, a.chain.height() - b.h.height + 1);
+            }
+        }
+        return { 200, "application/json", out + "]}" };
     }
     if (r.path == "/tail") {
         uint64_t n = r.query.count("n") ? strtoull(r.query.at("n").c_str(), nullptr, 10) : 10;

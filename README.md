@@ -86,6 +86,14 @@ No build step, no separate server: the node reads `web/viewer.html` and serves i
 
 What it does:
 
+- **Notes** *(the default tab)* — a write-and-read feed for the chain. Type a note,
+  hit **Sign & post**, and it's signed in your browser, committed on-chain, and appears
+  in the feed below **immediately** (as `pending`, then `block N · k conf` once mined).
+  Every note ever written is listed newest-first, decoded and readable, with a `you`
+  badge on yours, an "only mine" filter, and a **prove it** link that jumps to a
+  client-side Merkle verification. Ctrl+Enter posts; the counter enforces the 1 KB
+  payload cap. Notes are plain `RECORD` transactions, so `clctl record` and the web UI
+  write to the same feed.
 - **Explorer** — live status and a **convergence banner** across all three nodes,
   auto-refreshing recent blocks, click-through to block/transaction detail, address
   balances, mempool, and a universal search (height / txid / address).
@@ -188,9 +196,14 @@ deliberate simplification for a controlled local chain).
 
 ### Node RPC (JSON over HTTP, 127.0.0.1 only)
 
-`GET /status /balance /block /tx /mempool /tail /prove /work` ·
+`GET /status /balance /block /tx /mempool /records /tail /prove /work` ·
 `POST /submit /submitwork`. Any language that can do an HTTP GET can read the
 ledger; `curl http://127.0.0.1:8501/status`.
+
+`GET /records?limit=N[&addr=<hex40>]` is the notes feed: every `RECORD` transaction
+newest-first, with pending (mempool) ones listed ahead of confirmed. Payloads come back
+as hex, so arbitrary note text needs no escaping —
+`curl "http://127.0.0.1:8501/records?limit=5"`.
 
 ---
 

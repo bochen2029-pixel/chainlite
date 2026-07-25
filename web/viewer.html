@@ -50,6 +50,7 @@
   .btn{background:var(--accent);color:#fff;border:none;border-radius:8px;padding:9px 16px;cursor:pointer;font-weight:600}
   .btn:hover{filter:brightness(1.1)}
   .btn.sec{background:var(--panel2);color:var(--ink);border:1px solid var(--line)}
+  .btn.sm{padding:4px 10px;font-size:12px;font-weight:500}
   .btn:disabled{opacity:.5;cursor:not-allowed}
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   .msg{margin-top:10px;padding:9px 11px;border-radius:8px;font-family:var(--mono);font-size:12px;word-break:break-all;display:none}
@@ -70,8 +71,34 @@
   .foot{color:var(--dim);font-size:11px;text-align:center;margin:18px 0 6px}
   .small{font-size:11px;color:var(--dim)}
   .addr{cursor:pointer}
-  .flash{animation:fl 1s ease}
-  @keyframes fl{from{background:rgba(91,140,255,.25)}to{background:transparent}}
+  /* ---- notes feed ---- */
+  .compose{display:flex;flex-direction:column;gap:8px}
+  .compose textarea{min-height:84px;font-family:inherit;font-size:14.5px;line-height:1.55}
+  .composebar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .counter{font-family:var(--mono);font-size:11px;color:var(--dim)}
+  .counter.over{color:var(--bad);font-weight:700}
+  .note{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--line);
+        border-radius:10px;padding:12px 14px;margin-bottom:10px;transition:border-color .3s}
+  .note.mine{border-left-color:var(--accent)}
+  .note.pending{border-left-color:var(--warn);background:linear-gradient(90deg,rgba(244,191,95,.05),transparent 40%)}
+  .note.fresh{animation:pop .8s ease}
+  @keyframes pop{from{background:rgba(91,140,255,.16)}to{background:var(--panel)}}
+  .note-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:7px;font-size:11.5px;color:var(--dim)}
+  .note-head .who{font-family:var(--mono);cursor:pointer}
+  .note-head .who:hover{color:var(--accent)}
+  .chip{font-size:10px;padding:1px 7px;border-radius:20px;font-weight:700;letter-spacing:.03em}
+  .chip.you{background:rgba(91,140,255,.2);color:#9db8ff}
+  .chip.conf{background:rgba(55,211,155,.14);color:var(--good)}
+  .chip.pend{background:rgba(244,191,95,.16);color:var(--warn)}
+  .chip.hash{background:rgba(139,152,180,.16);color:var(--dim)}
+  .note-body{font-size:14.5px;line-height:1.6;white-space:pre-wrap;word-break:break-word;color:var(--ink)}
+  .note-body.filehash{font-family:var(--mono);font-size:12px;color:var(--dim);word-break:break-all}
+  .note-actions{display:flex;gap:12px;margin-top:8px;font-size:11px}
+  .note-actions a{color:var(--dim)}
+  .note-actions a:hover{color:var(--accent)}
+  .feedhead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+  .empty{color:var(--dim);text-align:center;padding:28px;font-size:13px}
+  .switch{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dim);cursor:pointer;user-select:none}
 </style>
 </head>
 <body>
@@ -90,13 +117,45 @@
   </div>
 
   <div class="tabs">
-    <div class="tab active" data-tab="explore">Explorer</div>
+    <div class="tab active" data-tab="notes">Notes</div>
+    <div class="tab" data-tab="explore">Explorer</div>
     <div class="tab" data-tab="wallet">Wallet</div>
     <div class="tab" data-tab="verify">Verify proof</div>
   </div>
 
+  <!-- NOTES: write to the chain, read it straight back -->
+  <div id="tab-notes">
+    <div class="card">
+      <h2>Write a note to the blockchain</h2>
+      <div id="noteNoWallet" class="hidden">
+        <p class="small">You need a keypair to sign notes. It's generated and stored in this browser only.</p>
+        <button class="btn" id="noteGenKey">Create a wallet</button>
+      </div>
+      <div id="noteCompose" class="compose hidden">
+        <textarea class="in" id="noteText" placeholder="Type a note… it gets signed in this browser, committed on-chain, and appears below. (Ctrl+Enter to post)"></textarea>
+        <div class="composebar">
+          <button class="btn" id="postBtn">Sign &amp; post to chain</button>
+          <span class="counter" id="noteCount">0 / 1024 bytes</span>
+          <span class="grow"></span>
+          <span class="small">signing as <span class="mono addr" id="noteAddr"></span></span>
+        </div>
+        <div class="msg" id="noteMsg"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="feedhead">
+        <h2 style="margin:0">On-chain notes</h2>
+        <span class="small" id="noteStat"></span>
+        <span class="grow"></span>
+        <label class="switch"><input type="checkbox" id="onlyMine"> only mine</label>
+      </div>
+      <div id="feed"><div class="empty">loading…</div></div>
+    </div>
+  </div>
+
   <!-- EXPLORER -->
-  <div id="tab-explore">
+  <div id="tab-explore" class="hidden">
     <div class="grid">
       <div>
         <div class="card">
@@ -161,16 +220,14 @@
           <div class="msg" id="sendMsg"></div>
         </div>
         <div class="card">
-          <h2>Notarize (record)</h2>
-          <label>Text to record</label>
-          <textarea class="in" id="rText" placeholder="arbitrary note committed on-chain (≤1KB)"></textarea>
+          <h2>Notarize a file</h2>
+          <p class="small">Commits a file's sha256 on-chain (the bytes never leave your machine). For text notes use the Notes tab.</p>
           <div class="row" style="margin:8px 0">
-            <span class="small">or</span>
-            <button class="btn sec" id="rFileBtn">Hash a file…</button>
+            <button class="btn sec" id="rFileBtn">Choose file…</button>
             <input type="file" id="rFile" style="display:none">
             <span class="small" id="rFileName"></span>
           </div>
-          <div class="row"><button class="btn" id="recBtn" disabled>Sign &amp; record</button></div>
+          <div class="row"><button class="btn" id="recBtn" disabled>Sign &amp; record hash</button></div>
           <div class="msg" id="recMsg"></div>
         </div>
       </div>
@@ -181,7 +238,7 @@
   <div id="tab-verify" class="hidden">
     <div class="card">
       <h2>Verify inclusion proof</h2>
-      <p class="small">Paste a proof (from <code>clctl prove</code> or the tx panel's “Get proof” button). Verification runs entirely in your browser — recomputing the Merkle path, the header hash, and the proof-of-work — then cross-checks that all reachable nodes carry that block.</p>
+      <p class="small">Paste a proof (from <code>clctl prove</code> or a note's “prove” link). Verification runs entirely in your browser — recomputing the Merkle path, the header hash, and the proof-of-work — then cross-checks that all reachable nodes carry that block.</p>
       <textarea class="in mono" id="proofText" style="min-height:150px" placeholder="CHAINLITE-PROOF v1&#10;txid …"></textarea>
       <div class="row" style="margin-top:10px"><button class="btn" id="verifyBtn">Verify</button></div>
       <div id="verifyOut"></div>
@@ -207,6 +264,8 @@ function u32le(n){ const b=new Uint8Array(4); let v=n>>>0; for(let i=0;i<4;i++){
 function u64le(n){ const b=new Uint8Array(8); let v=BigInt(n); for(let i=0;i<8;i++){b[i]=Number(v&0xffn);v>>=8n;} return b; }
 function u32le_read(b,o){ return (b[o]|(b[o+1]<<8)|(b[o+2]<<16)|(b[o+3]<<24))>>>0; }
 const enc = new TextEncoder();
+// Notes come off a public chain — always escape before inserting into HTML.
+function esc(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 // ---------- hashing ----------
 async function sha256(b){ return new Uint8Array(await crypto.subtle.digest("SHA-256", b)); }
@@ -226,7 +285,7 @@ async function rpost(path, bodyText, port=PORT){
 }
 
 // ---------- wallet ----------
-let WALLET = null; // {priv:CryptoKey, pub:Uint8Array(64), addr:Uint8Array(20), addrHex, netid}
+let WALLET = null; // {priv:CryptoKey, pub:Uint8Array(64), addr:Uint8Array(20), addrHex}
 async function addrOf(pub64){ return (await sha256(pub64)).slice(0,20); }
 
 async function setWallet(privKey, pub64){
@@ -236,7 +295,17 @@ async function setWallet(privKey, pub64){
   $("#haveWallet").classList.remove("hidden");
   $("#wAddr").textContent = WALLET.addrHex;
   $("#sendBtn").disabled = false; $("#recBtn").disabled = false;
+  // notes composer
+  $("#noteNoWallet").classList.add("hidden");
+  $("#noteCompose").classList.remove("hidden");
+  $("#noteAddr").textContent = WALLET.addrHex.slice(0,12)+"…";
   refreshWalletBalance();
+  renderFeed();
+}
+function noWalletUI(){
+  $("#haveWallet").classList.add("hidden"); $("#noWallet").classList.remove("hidden");
+  $("#sendBtn").disabled=true; $("#recBtn").disabled=true;
+  $("#noteCompose").classList.add("hidden"); $("#noteNoWallet").classList.remove("hidden");
 }
 async function saveWallet(){
   if(!WALLET) return;
@@ -244,12 +313,12 @@ async function saveWallet(){
   localStorage.setItem("chainlite_wallet", JSON.stringify({jwk, pub:toHex(WALLET.pub)}));
 }
 async function loadWallet(){
-  const raw = localStorage.getItem("chainlite_wallet"); if(!raw) return;
+  const raw = localStorage.getItem("chainlite_wallet"); if(!raw){ noWalletUI(); return; }
   try{
     const {jwk, pub} = JSON.parse(raw);
     const priv = await crypto.subtle.importKey("jwk", jwk, {name:"ECDSA",namedCurve:"P-256"}, true, ["sign"]);
     await setWallet(priv, fromHex(pub));
-  }catch(e){ console.warn("wallet load failed", e); }
+  }catch(e){ console.warn("wallet load failed", e); noWalletUI(); }
 }
 async function genWallet(){
   const kp = await crypto.subtle.generateKey({name:"ECDSA",namedCurve:"P-256"}, true, ["sign","verify"]);
@@ -300,12 +369,101 @@ async function makeAndSubmit(type, to20, amount, payload, msgEl){
   return txid;
 }
 
-// ---------- rendering ----------
+// ---------- notes feed ----------
+let NOTES = [];            // newest first, from /records
+let seenTxids = new Set(); // for the "fresh" highlight animation
+let firstFeedLoad = true;
+
+function decodePayload(hex){
+  const bytes = fromHex(hex);
+  try{
+    const text = new TextDecoder("utf-8",{fatal:true}).decode(bytes);
+    // printable text => a note
+    if(!/[\x00-\x08\x0e-\x1f]/.test(text)) return {kind:"text", text};
+  }catch(e){}
+  return {kind:"hash", text:hex};
+}
+function timeAgo(t){
+  if(!t) return "just now";
+  const d=Math.floor(Date.now()/1000)-t;
+  if(d<5) return "just now";
+  if(d<60)return d+"s ago";
+  if(d<3600)return Math.floor(d/60)+"m ago";
+  if(d<86400)return Math.floor(d/3600)+"h ago";
+  return new Date(t*1000).toLocaleDateString();
+}
+async function refreshNotes(){
+  try{
+    const {records} = await rgetJson("/records?limit=200");
+    NOTES = records || [];
+    renderFeed();
+  }catch(e){
+    if(firstFeedLoad) $("#feed").innerHTML = `<div class="empty">node ${PORT} unreachable</div>`;
+  }
+}
+function renderFeed(){
+  const mineOnly = $("#onlyMine").checked;
+  const me = WALLET ? WALLET.addrHex : null;
+  let list = NOTES;
+  if(mineOnly && me) list = list.filter(r=>r.from===me);
+  const pend = NOTES.filter(r=>r.status==="pending").length;
+  $("#noteStat").textContent = `${NOTES.length} note${NOTES.length===1?"":"s"} on chain` + (pend?` · ${pend} pending`:"");
+  if(!list.length){
+    $("#feed").innerHTML = `<div class="empty">${mineOnly?"you haven't posted any notes yet":"no notes on the chain yet — write the first one above"}</div>`;
+    firstFeedLoad = false; return;
+  }
+  $("#feed").innerHTML = list.map(r=>{
+    const d = decodePayload(r.payload_hex);
+    const mine = me && r.from===me;
+    const fresh = !firstFeedLoad && !seenTxids.has(r.txid);
+    const cls = ["note", mine?"mine":"", r.status==="pending"?"pending":"", fresh?"fresh":""].filter(Boolean).join(" ");
+    const status = r.status==="pending"
+      ? `<span class="chip pend">pending</span>`
+      : `<span class="chip conf">block ${r.height} · ${r.confirmations} conf</span>`;
+    const body = d.kind==="text"
+      ? `<div class="note-body">${esc(d.text)}</div>`
+      : `<div class="note-body filehash"><span class="chip hash">file sha256</span> ${esc(d.text)}</div>`;
+    const actions = r.status==="confirmed"
+      ? `<a onclick="lookup('${r.txid}')">tx ${r.txid.slice(0,12)}…</a><a onclick="getProof('${r.txid}')">prove it</a>`
+      : `<a onclick="lookup('${r.txid}')">tx ${r.txid.slice(0,12)}…</a>`;
+    return `<div class="${cls}">
+      <div class="note-head">
+        <span class="who" onclick="lookup('${r.from}')">${r.from.slice(0,12)}…</span>
+        ${mine?'<span class="chip you">you</span>':''}
+        ${status}
+        <span>${timeAgo(r.time)}</span>
+      </div>
+      ${body}
+      <div class="note-actions">${actions}</div>
+    </div>`;
+  }).join("");
+  NOTES.forEach(r=>seenTxids.add(r.txid));
+  firstFeedLoad = false;
+}
+function updateCounter(){
+  const n = enc.encode($("#noteText").value).length;
+  const el = $("#noteCount");
+  el.textContent = `${n} / 1024 bytes`;
+  el.classList.toggle("over", n>1024);
+}
+async function postNote(){
+  const text = $("#noteText").value;
+  const msg = $("#noteMsg");
+  if(!text.trim()){ msg.className="msg err show"; msg.textContent="write something first"; return; }
+  const payload = enc.encode(text);
+  if(payload.length>1024){ msg.className="msg err show"; msg.textContent=`too long: ${payload.length} bytes (max 1024)`; return; }
+  $("#postBtn").disabled = true;
+  try{
+    const txid = await makeAndSubmit(TX_RECORD, new Uint8Array(20), 0, payload, msg);
+    if(txid){ $("#noteText").value=""; updateCounter(); await refreshNotes(); }  // shows up instantly as pending
+  }catch(e){ msg.className="msg err show"; msg.textContent=e.message; }
+  $("#postBtn").disabled = false;
+}
+
+// ---------- rendering (explorer) ----------
 function tshort(h,n=16){ return h.slice(0,n)+"…"; }
-function timeAgo(t){ const d=Math.floor(Date.now()/1000)-t; if(d<60)return d+"s ago"; if(d<3600)return Math.floor(d/60)+"m ago"; return Math.floor(d/3600)+"h ago"; }
 
 async function refreshStatus(){
-  // per-node pills for the selected node + convergence strip for all
   let sels=null; const strip=[];
   for(const p of PORTS){
     try{ const s=await rgetJson("/status",p); strip.push({p,s}); if(p===PORT) sels=s;
@@ -319,7 +477,6 @@ async function refreshStatus(){
       ["peers",sels.peers],["mempool",sels.mempool],["mining",sels.mining?"on":"off"],["difficulty",sels.bits+" bits"]
     ].map(([k,v])=>`<div class="pill"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
   } else pills.innerHTML = `<div class="msg err show">node ${PORT} unreachable — is it running?</div>`;
-  // convergence
   const live=strip.filter(x=>x.s);
   const tips=new Set(live.map(x=>x.s.tip));
   const conv=$("#conv");
@@ -364,16 +521,15 @@ async function showBlock(h){
     <h2 style="margin-top:14px">Transactions (${b.ntx})</h2>
     <table>${txrows}</table></div>`;
   $("#q").value=String(h);
-  document.querySelector('.tab[data-tab="explore"]').click();
+  showTab("explore");
 }
 async function showTx(id){
   const t=await rgetJson("/tx?id="+id);
-  if(t.error){ $("#qout").innerHTML=`<div class="msg err show" style="margin-top:12px">${t.error}</div>`; return; }
+  if(t.error){ $("#qout").innerHTML=`<div class="msg err show" style="margin-top:12px">${esc(t.error)}</div>`; showTab("explore"); return; }
   let payloadView="";
   if(t.type===2 && t.payload_hex){
-    const bytes=fromHex(t.payload_hex);
-    let asText=""; try{ asText=new TextDecoder("utf-8",{fatal:true}).decode(bytes);}catch(e){asText="";}
-    payloadView=`<div class="k">payload</div><div>${t.payload_hex.length===64?'sha256: ':''}<code>${t.payload_hex}</code>${asText?`<br><span class="small">as text: “${asText}”</span>`:''}</div>`;
+    const d = decodePayload(t.payload_hex);
+    payloadView=`<div class="k">payload</div><div>${d.kind==="text"?`“${esc(d.text)}”`:`sha256 <code>${esc(d.text)}</code>`}</div>`;
   }
   const proofBtn = t.status==="confirmed" ? `<button class="btn sec" onclick="getProof('${id}')">Get proof</button>` : "";
   $("#qout").innerHTML=`<div class="card" style="margin-top:12px"><h2>Transaction ${TAGS[t.type]||''}</h2>
@@ -385,14 +541,19 @@ async function showTx(id){
       ${t.nonce!==undefined?`<div class="k">nonce</div><div>${t.nonce}</div>`:''}
       ${payloadView}
     </div><div class="row" style="margin-top:12px">${proofBtn}</div></div>`;
+  showTab("explore");
 }
 async function showAddr(a){
   const b=await rgetJson("/balance?addr="+a);
-  $("#qout").innerHTML=`<div class="card" style="margin-top:12px"><h2>Address</h2>
+  const mine = WALLET && WALLET.addrHex===a;
+  const n = NOTES.filter(r=>r.from===a).length;
+  $("#qout").innerHTML=`<div class="card" style="margin-top:12px"><h2>Address ${mine?'<span class="chip you">you</span>':''}</h2>
     <div class="kv"><div class="k">address</div><div>${a}</div>
     <div class="k">balance</div><div>${b.balance} LITE</div>
-    <div class="k">nonce</div><div>${b.nonce}</div></div>
+    <div class="k">nonce</div><div>${b.nonce}</div>
+    <div class="k">notes</div><div>${n} in the current feed</div></div>
     <div class="row" style="margin-top:10px"><button class="btn sec" onclick="prefillSend('${a}')">Send to this address</button></div></div>`;
+  showTab("explore");
 }
 async function lookup(q){
   q=(q||"").trim().toLowerCase();
@@ -402,12 +563,13 @@ async function lookup(q){
     if(/^[0-9a-f]{64}$/.test(q)) return showTx(q);
     if(/^[0-9a-f]{40}$/.test(q)) return showAddr(q);
     $("#qout").innerHTML=`<div class="msg err show" style="margin-top:12px">enter a height (number), txid (64 hex), or address (40 hex)</div>`;
-  }catch(e){ $("#qout").innerHTML=`<div class="msg err show" style="margin-top:12px">${e.message}</div>`; }
+    showTab("explore");
+  }catch(e){ $("#qout").innerHTML=`<div class="msg err show" style="margin-top:12px">${esc(e.message)}</div>`; showTab("explore"); }
 }
 async function getProof(id){
   const txt=await rgetText("/prove?txid="+id);
   $("#proofText").value=txt;
-  document.querySelector('.tab[data-tab="verify"]').click();
+  showTab("verify");
   verifyProof();
 }
 
@@ -426,20 +588,16 @@ async function verifyProof(){
   }
   if(!txid||!header||blockhash===undefined){ out.innerHTML=`<div class="msg err show">malformed proof</div>`; return; }
   const checks=[];
-  // 1. header hashes to blockhash
   const hbytes=fromHex(header);
   const hh=toHex(await sha256d(hbytes));
   checks.push(["header hash → blockhash", hh===blockhash]);
-  // 2. merkle path from txid reaches header's merkle root (header bytes 40..72)
   const merkleInHeader=toHex(hbytes.slice(40,72));
   let acc=fromHex(txid);
   for(const s of steps){ const sib=fromHex(s.h); acc = s.left? await sha256d(cat(sib,acc)) : await sha256d(cat(acc,sib)); }
   checks.push(["merkle path → root", toHex(acc)===merkleInHeader]);
-  // 3. proof-of-work: blockhash has >= bits leading zero bits (bits at header offset 88)
   const bits=u32le_read(hbytes,88);
   const powOk = height===0 || leadingZeroBits(fromHex(blockhash))>=bits;
   checks.push([`proof-of-work (${bits} bits)`, powOk]);
-  // 4. cross-check nodes
   const nodeRows=[];
   for(const p of PORTS){
     try{ const b=await rgetJson("/block?height="+height,p);
@@ -451,7 +609,7 @@ async function verifyProof(){
   const reach=nodeRows.filter(r=>r[1]!==null).length;
   const valid=allLocal && agree>0 && agree===reach;
   out.innerHTML=`<div class="card" style="margin-top:12px">
-    <div class="kv"><div class="k">txid</div><div>${txid}</div>
+    <div class="kv"><div class="k">txid</div><div>${esc(txid)}</div>
       <div class="k">committed at</div><div>height ${height}, block ${tshort(blockhash,20)}</div></div>
     <table style="margin-top:10px"><tbody>
     ${checks.map(c=>`<tr><td>${c[0]}</td><td style="color:${c[1]?'var(--good)':'var(--bad)'}">${c[1]?'✓ pass':'✗ FAIL'}</td></tr>`).join("")}
@@ -460,33 +618,38 @@ async function verifyProof(){
     <div class="msg ${valid?'ok':'err'} show" style="margin-top:12px;font-size:14px;font-weight:700">VERDICT: ${valid?'VALID':'INVALID'}</div></div>`;
 }
 
-// ---------- node picker UI ----------
+// ---------- node picker + tabs ----------
 function renderNodes(){
   $("#nodes").innerHTML = PORTS.map(p=>`<div class="nodebtn ${p===PORT?'active':''}" id="nb${p}" onclick="selectNode(${p})"><span class="dot"></span>:${p}</div>`).join("");
 }
 function setNodeUp(p, up, h){ const el=$("#nb"+p); if(!el)return; el.classList.toggle("up",up); el.classList.toggle("down",!up);
   el.innerHTML=`<span class="dot"></span>:${p}${up&&h!==undefined?` · ${h}`:''}`; }
-function selectNode(p){ PORT=p; renderNodes(); refreshAll(); }
+function selectNode(p){ PORT=p; renderNodes(); firstFeedLoad=true; refreshAll(); }
+function showTab(name){
+  document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active", x.dataset.tab===name));
+  for(const t of ["notes","explore","wallet","verify"]) $("#tab-"+t).classList.toggle("hidden", t!==name);
+}
 
 // ---------- wiring ----------
-function prefillSend(a){ document.querySelector('.tab[data-tab="wallet"]').click(); $("#sTo").value=a; $("#sAmt").focus(); }
-document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
-  document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active")); t.classList.add("active");
-  for(const name of ["explore","wallet","verify"]) $("#tab-"+name).classList.toggle("hidden", name!==t.dataset.tab);
-});
+function prefillSend(a){ showTab("wallet"); $("#sTo").value=a; $("#sAmt").focus(); }
+document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>showTab(t.dataset.tab));
 $("#qgo").onclick=()=>lookup($("#q").value);
 $("#q").addEventListener("keydown",e=>{ if(e.key==="Enter") lookup($("#q").value); });
 $("#genKey").onclick=()=>genWallet().catch(e=>alert(e.message));
+$("#noteGenKey").onclick=()=>genWallet().catch(e=>alert(e.message));
 $("#importBtn").onclick=()=>$("#keyFile").click();
 $("#keyFile").onchange=async()=>{ const f=$("#keyFile").files[0]; if(!f)return;
   const txt=await f.text(); const lines=txt.split(/\r?\n/);
   const hex=(lines[0].startsWith("chainlite-key")? lines[1]: lines[0]).trim();
   try{ await importKeyBlobHex(hex); }catch(e){ alert("import failed: "+e.message); } };
-$("#forget").onclick=()=>{ localStorage.removeItem("chainlite_wallet"); WALLET=null;
-  $("#haveWallet").classList.add("hidden"); $("#noWallet").classList.remove("hidden");
-  $("#sendBtn").disabled=true; $("#recBtn").disabled=true; };
+$("#forget").onclick=()=>{ localStorage.removeItem("chainlite_wallet"); WALLET=null; noWalletUI(); renderFeed(); };
 $("#copyAddr").onclick=()=>navigator.clipboard.writeText(WALLET.addrHex);
 $("#wAddr").onclick=()=>navigator.clipboard.writeText(WALLET.addrHex);
+$("#noteAddr").onclick=()=>navigator.clipboard.writeText(WALLET.addrHex);
+$("#postBtn").onclick=postNote;
+$("#noteText").addEventListener("input", updateCounter);
+$("#noteText").addEventListener("keydown", e=>{ if(e.key==="Enter" && (e.ctrlKey||e.metaKey)) postNote(); });
+$("#onlyMine").onchange=renderFeed;
 $("#sendBtn").onclick=async()=>{
   const to=$("#sTo").value.trim().toLowerCase(), amt=parseInt($("#sAmt").value);
   if(!/^[0-9a-f]{40}$/.test(to)) return void($("#sendMsg").className="msg err show", $("#sendMsg").textContent="bad recipient address");
@@ -499,26 +662,27 @@ $("#sendBtn").onclick=async()=>{
 let recFileBytes=null;
 $("#rFileBtn").onclick=()=>$("#rFile").click();
 $("#rFile").onchange=async()=>{ const f=$("#rFile").files[0]; if(!f)return;
-  recFileBytes=new Uint8Array(await f.arrayBuffer()); $("#rFileName").textContent=f.name+" ("+recFileBytes.length+" B)"; $("#rText").value=""; };
+  recFileBytes=new Uint8Array(await f.arrayBuffer()); $("#rFileName").textContent=f.name+" ("+recFileBytes.length+" B)"; };
 $("#recBtn").onclick=async()=>{
   $("#recBtn").disabled=true;
   try{
-    let payload;
-    if(recFileBytes){ payload=await sha256(recFileBytes); $("#recMsg").className="msg info show"; $("#recMsg").textContent="recording sha256 = "+toHex(payload); }
-    else { const t=$("#rText").value; if(!t){ throw new Error("enter text or pick a file"); } payload=enc.encode(t); if(payload.length>1024) throw new Error("text too long (max 1024 bytes)"); }
+    if(!recFileBytes) throw new Error("choose a file first");
+    const payload=await sha256(recFileBytes);
+    $("#recMsg").className="msg info show"; $("#recMsg").textContent="recording sha256 = "+toHex(payload);
     await makeAndSubmit(TX_RECORD, new Uint8Array(20), 0, payload, $("#recMsg"));
-    recFileBytes=null; $("#rFileName").textContent="";
+    recFileBytes=null; $("#rFileName").textContent=""; refreshNotes();
   }catch(e){ $("#recMsg").className="msg err show"; $("#recMsg").textContent=e.message; }
   $("#recBtn").disabled=false;
 };
-$("#verifyBtn").onclick=()=>verifyProof().catch(e=>$("#verifyOut").innerHTML=`<div class="msg err show">${e.message}</div>`);
+$("#verifyBtn").onclick=()=>verifyProof().catch(e=>$("#verifyOut").innerHTML=`<div class="msg err show">${esc(e.message)}</div>`);
 
 // ---------- loop ----------
-function refreshAll(){ refreshStatus(); refreshBlocks(); refreshMempool(); refreshWalletBalance(); }
+function refreshAll(){ refreshStatus(); refreshBlocks(); refreshMempool(); refreshNotes(); refreshWalletBalance(); }
 renderNodes();
+updateCounter();
 loadWallet();
 refreshAll();
-setInterval(()=>{ refreshStatus(); refreshBlocks(); refreshMempool(); }, 2500);
+setInterval(()=>{ refreshStatus(); refreshBlocks(); refreshMempool(); refreshNotes(); }, 2500);
 window.lookup=lookup; window.showBlock=showBlock; window.selectNode=selectNode;
 window.getProof=getProof; window.prefillSend=prefillSend;
 </script>
